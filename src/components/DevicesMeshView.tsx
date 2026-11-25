@@ -102,6 +102,10 @@ export const DevicesMeshView: React.FC<DevicesMeshViewProps> = ({
   const [lastCmdOutput, setLastCmdOutput] = useState<string | null>(null);
   const [cmdBusy, setCmdBusy] = useState(false);
 
+  const [nativeCatalog, setNativeCatalog] = useState<
+    Array<{ os: 'linux' | 'windows' | 'android'; filename: string; downloadUrl: string; source?: string }>
+  >([]);
+
   const wsRef = useRef<WebSocket | null>(null);
 
   const loadDevices = useCallback(async () => {
@@ -131,6 +135,12 @@ export const DevicesMeshView: React.FC<DevicesMeshViewProps> = ({
 
   useEffect(() => {
     void loadDevices();
+    fetch('/api/installers/catalog')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (d?.artifacts) setNativeCatalog(d.artifacts);
+      })
+      .catch(() => {});
   }, [loadDevices]);
 
   useEffect(() => {
@@ -563,21 +573,35 @@ export const DevicesMeshView: React.FC<DevicesMeshViewProps> = ({
                   Aplicativo real do Android (<code>com.aegis.agent</code>) com <strong>ForegroundService</strong>, <strong>AccessibilityService</strong> (toques, gestos e leitura de tela), <strong>NotificationListener</strong>, acesso a <code>/sdcard</code> e inicialização no boot — já pré-configurado com este servidor{pairInfo ? ` e código ${pairInfo.code}` : ''}.
                 </p>
                 <div className="flex flex-wrap gap-2 pt-1">
-                  <a
-                    href={
-                      pairInfo
-                        ? `/api/installers/android/AegisAndroid-Native-2.0.0.zip?code=${encodeURIComponent(pairInfo.code)}`
-                        : '/api/installers/android/AegisAndroid-Native-2.0.0.zip'
-                    }
-                    download="AegisAndroid-Native-2.0.0.zip"
-                    className="min-h-[40px] inline-flex items-center gap-2 rounded-xl bg-amber-500 px-4 text-xs font-semibold text-slate-950 hover:bg-amber-400 transition-colors"
-                  >
-                    <Download className="h-4 w-4" />
-                    <span>Baixar App Nativo Android (.zip / APK)</span>
-                  </a>
+                  {(() => {
+                    const primaryAndroid = nativeCatalog.find((a) => a.os === 'android');
+                    const isCompiledApk = primaryAndroid?.source === 'github_release';
+                    const href = isCompiledApk
+                      ? primaryAndroid!.downloadUrl
+                      : pairInfo
+                      ? `/api/installers/android/AegisAndroid-Native-2.1.0.zip?code=${encodeURIComponent(pairInfo.code)}`
+                      : '/api/installers/android/AegisAndroid-Native-2.1.0.zip';
+                    const fname = primaryAndroid?.filename || 'AegisAndroid-Native-2.1.0.zip';
+                    return (
+                      <a
+                        href={href}
+                        download={isCompiledApk ? undefined : fname}
+                        target={isCompiledApk ? '_blank' : undefined}
+                        rel={isCompiledApk ? 'noopener noreferrer' : undefined}
+                        className="min-h-[40px] inline-flex items-center gap-2 rounded-xl bg-amber-500 px-4 text-xs font-semibold text-slate-950 hover:bg-amber-400 transition-colors"
+                      >
+                        <Download className="h-4 w-4" />
+                        <span>
+                          {isCompiledApk
+                            ? `Baixar ${fname} (APK Compilado)`
+                            : 'Baixar App Nativo Android v2.1 (.zip -> APK)'}
+                        </span>
+                      </a>
+                    );
+                  })()}
                 </div>
                 <p className="text-[11px] text-slate-400">
-                  Compile o <code>.apk</code> no Android Studio, com <code>./build-apk.sh</code> ou em 1 clique no GitHub Actions incluso no pacote.
+                  Vincule seu repositório GitHub na aba <strong>Apps Nativos</strong> após rodar o workflow <code>release-all-apps.yml</code> para baixar o <code>.apk</code> compilado direto neste botão.
                 </p>
               </div>
 
@@ -666,12 +690,12 @@ export const DevicesMeshView: React.FC<DevicesMeshViewProps> = ({
               </p>
               <div className="flex flex-wrap gap-2.5">
                 <a
-                  href="/api/installers/linux/aegis-desktop_2.0.0_amd64.deb"
-                  download="aegis-desktop_2.0.0_amd64.deb"
+                  href="/api/installers/linux/aegis-desktop_2.1.0_amd64.deb"
+                  download="aegis-desktop_2.1.0_amd64.deb"
                   className="min-h-[40px] inline-flex items-center gap-2 rounded-xl bg-amber-500 px-4 text-xs font-semibold text-slate-950 hover:bg-amber-400"
                 >
                   <Download className="h-4 w-4" />
-                  <span>Linux (.deb · ELF x86_64)</span>
+                  <span>Linux v2.1 (.deb · ELF x86_64)</span>
                 </a>
                 <a
                   href="/api/installers/linux/aegis-desktop-linux-x64.tar.gz"
@@ -681,14 +705,26 @@ export const DevicesMeshView: React.FC<DevicesMeshViewProps> = ({
                   <Download className="h-4 w-4 text-amber-400" />
                   <span>Linux Universal (.tar.gz)</span>
                 </a>
-                <a
-                  href="/api/installers/windows/AegisDesktop-Windows-Native-2.0.0.zip"
-                  download="AegisDesktop-Windows-Native-2.0.0.zip"
-                  className="min-h-[40px] inline-flex items-center gap-2 rounded-xl border border-sky-400/40 bg-sky-500/15 px-4 text-xs font-semibold text-sky-200 hover:bg-sky-500/25"
-                >
-                  <Download className="h-4 w-4" />
-                  <span>Windows (AegisDesktop.exe)</span>
-                </a>
+                {(() => {
+                  const primaryWin = nativeCatalog.find((a) => a.os === 'windows');
+                  const isCompiledWin = primaryWin?.source === 'github_release';
+                  const winHref = isCompiledWin
+                    ? primaryWin!.downloadUrl
+                    : '/api/installers/windows/AegisDesktop-Windows-Native-2.1.0.zip';
+                  const winName = primaryWin?.filename || 'AegisDesktop-Windows-Native-2.1.0.zip';
+                  return (
+                    <a
+                      href={winHref}
+                      download={isCompiledWin ? undefined : winName}
+                      target={isCompiledWin ? '_blank' : undefined}
+                      rel={isCompiledWin ? 'noopener noreferrer' : undefined}
+                      className="min-h-[40px] inline-flex items-center gap-2 rounded-xl border border-sky-400/40 bg-sky-500/15 px-4 text-xs font-semibold text-sky-200 hover:bg-sky-500/25"
+                    >
+                      <Download className="h-4 w-4" />
+                      <span>{isCompiledWin ? `Windows (${winName})` : 'Windows v2.1 (AegisDesktop.exe)'}</span>
+                    </a>
+                  );
+                })()}
               </div>
               <div className="rounded-xl border border-white/10 bg-[#060910] p-3 font-mono text-[11px] text-emerald-300 break-all">
                 {`AEGIS_CLOUD_URL="${pairInfo?.origin || currentOrigin}" AEGIS_PAIR_CODE="${pairInfo?.code || 'SEU_CODIGO'}" aegis-desktop --start`}

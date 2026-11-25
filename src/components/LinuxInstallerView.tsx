@@ -3,9 +3,12 @@ import {
   Copy,
   Cpu,
   Download,
+  ExternalLink,
   FileCode2,
+  GitBranch,
   HardDrive,
   Laptop,
+  Link2,
   Loader2,
   Monitor,
   Package,
@@ -32,13 +35,26 @@ interface NativeArtifactMeta {
   sizeBytes: number | null;
   sha256: string | null;
   compiledOnServer: boolean;
+  source?: 'server_compiled' | 'github_release' | 'build_kit';
+  releaseTag?: string | null;
   installSteps: string[];
   capabilities: string[];
+}
+
+interface GithubReleaseSyncInfo {
+  repo: string | null;
+  status: 'unconfigured' | 'linked' | 'no_releases' | 'error';
+  releaseTag: string | null;
+  releaseUrl: string | null;
+  publishedAt: string | null;
+  syncedAssetsCount: number;
+  message: string;
 }
 
 interface CatalogResponse {
   version: string;
   builtAt: string;
+  githubSync?: GithubReleaseSyncInfo;
   artifacts: NativeArtifactMeta[];
 }
 
@@ -55,6 +71,10 @@ export const LinuxInstallerView: React.FC = () => {
   const [catalogLoading, setCatalogLoading] = useState(true);
   const [catalogError, setCatalogError] = useState<string | null>(null);
 
+  const [githubRepoInput, setGithubRepoInput] = useState('');
+  const [savingGithubRepo, setSavingGithubRepo] = useState(false);
+  const [githubRepoFeedback, setGithubRepoFeedback] = useState<string | null>(null);
+
   const [files, setFiles] = useState<BundleFile[]>([]);
   const [selectedName, setSelectedName] = useState('aegis-daemon.mjs');
   const [showInspector, setShowInspector] = useState(false);
@@ -70,17 +90,20 @@ export const LinuxInstallerView: React.FC = () => {
   const [androidPairCode, setAndroidPairCode] = useState<string | null>(null);
   const [generatingAndroidCode, setGeneratingAndroidCode] = useState(false);
 
-  const loadCatalog = async () => {
+  const loadCatalog = async (refresh = false) => {
     setCatalogLoading(true);
     setCatalogError(null);
     try {
-      const res = await fetch('/api/installers/catalog');
+      const res = await fetch(refresh ? '/api/installers/catalog?refresh=1' : '/api/installers/catalog');
       if (!res.ok) {
         const errBody = await res.json().catch(() => ({}));
         throw new Error(errBody.error || `HTTP ${res.status}`);
       }
       const data = (await res.json()) as CatalogResponse;
       setCatalog(data);
+      if (data.githubSync?.repo) {
+        setGithubRepoInput(data.githubSync.repo);
+      }
     } catch (err: unknown) {
       setCatalogError(err instanceof Error ? err.message : 'Falha ao carregar catálogo de aplicativos nativos.');
     } finally {
@@ -97,6 +120,32 @@ export const LinuxInstallerView: React.FC = () => {
       })
       .catch(() => {});
   }, []);
+
+  const handleSaveGithubRepo = async (repoValue: string) => {
+    setSavingGithubRepo(true);
+    setGithubRepoFeedback(null);
+    try {
+      const res = await apiFetch('/api/installers/github-repo', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ repo: repoValue.trim() }),
+      });
+      const data = (await res.json()) as { ok?: boolean; error?: string; catalog?: CatalogResponse };
+      if (!res.ok) {
+        setGithubRepoFeedback(data.error || 'Falha ao vincular repositório GitHub.');
+        return;
+      }
+      if (data.catalog) {
+        setCatalog(data.catalog);
+        setGithubRepoInput(data.catalog.githubSync?.repo || '');
+        setGithubRepoFeedback(data.catalog.githubSync?.message || 'Repositório sincronizado.');
+      }
+    } catch (err: unknown) {
+      setGithubRepoFeedback(err instanceof Error ? err.message : 'Erro de rede ao salvar repositório.');
+    } finally {
+      setSavingGithubRepo(false);
+    }
+  };
 
   const copyText = (key: string, text: string) => {
     void navigator.clipboard.writeText(text);
@@ -149,6 +198,7 @@ export const LinuxInstallerView: React.FC = () => {
   }, [catalog, osTab]);
 
   const activeFile = files.find((f) => f.name === selectedName) || files[0];
+  const ghSync = catalog?.githubSync;
 
   return (
     <div className="flex h-full flex-col overflow-hidden bg-[#070B12]">
@@ -207,6 +257,83 @@ export const LinuxInstallerView: React.FC = () => {
           </div>
         )}
 
+        {/* GitHub Releases Auto-Link Panel */}
+        <div className="rounded-2xl border border-sky-500/25 bg-[#0A111D] p-4 sm:p-5 space-y-3">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div className="space-y-1 min-w-0 flex-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <GitBranch className="h-4 w-4 text-sky-400 shrink-0" />
+                <span className="font-display text-sm font-semibold text-slate-100">
+                  Compilação Automática & Releases do GitHub (.APK / .EXE / .AppImage)
+                </span>
+                {ghSync?.status === 'linked' && ghSync.syncedAssetsCount > 0 && (
+                  <span className="font-mono text-[10px] uppercase tracking-wider text-emerald-300 border border-emerald-500/35 bg-emerald-500/12 px-2 py-0.5 rounded">
+                    {ghSync.releaseTag} · {ghSync.syncedAssetsCount} binário(s) vinculado(s)
+                  </span>
+                )}
+              </div>
+              <p className="text-xs text-slate-400 leading-relaxed">
+                Linux (<code className="text-amber-300">.deb</code> / ELF) já é compilado diretamente neste servidor. Para vincular o <strong className="text-slate-200">.APK Android</strong> e o <strong className="text-slate-200">.EXE Windows</strong> compilados pelo workflow <code className="text-sky-300">.github/workflows/release-all-apps.yml</code> diretamente aos botões abaixo, informe seu repositório GitHub:
+              </p>
+            </div>
+            {ghSync?.releaseUrl && (
+              <a
+                href={ghSync.releaseUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1.5 rounded-lg border border-sky-500/30 bg-sky-500/10 px-3 py-1.5 text-[11px] font-medium text-sky-200 hover:bg-sky-500/20 shrink-0"
+              >
+                <ExternalLink className="h-3.5 w-3.5" />
+                <span>Abrir no GitHub</span>
+              </a>
+            )}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <input
+              type="text"
+              value={githubRepoInput}
+              onChange={(e) => setGithubRepoInput(e.target.value)}
+              placeholder="usuario/repositorio ou https://github.com/usuario/repositorio"
+              className="flex-1 min-w-[240px] rounded-xl border border-white/12 bg-[#060910] px-3.5 py-2 text-xs font-mono text-slate-100 placeholder:text-slate-500 focus:border-sky-400 focus:outline-none"
+            />
+            <button
+              type="button"
+              disabled={savingGithubRepo}
+              onClick={() => void handleSaveGithubRepo(githubRepoInput)}
+              className="inline-flex items-center gap-1.5 rounded-xl bg-sky-500 px-3.5 py-2 text-xs font-semibold text-slate-950 hover:bg-sky-400 disabled:opacity-50 cursor-pointer"
+            >
+              {savingGithubRepo ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Link2 className="h-3.5 w-3.5" />}
+              <span>Vincular & Sincronizar</span>
+            </button>
+            {ghSync?.repo && (
+              <button
+                type="button"
+                disabled={catalogLoading}
+                onClick={() => void loadCatalog(true)}
+                className="inline-flex items-center gap-1.5 rounded-xl border border-white/12 bg-[#141B29] px-3 py-2 text-xs font-medium text-slate-200 hover:border-sky-400/50 cursor-pointer"
+              >
+                <RefreshCw className={`h-3.5 w-3.5 ${catalogLoading ? 'animate-spin' : ''}`} />
+                <span>Atualizar</span>
+              </button>
+            )}
+          </div>
+
+          {(githubRepoFeedback || ghSync?.message) && (
+            <p
+              className={`text-[11px] leading-relaxed ${
+                ghSync?.status === 'linked' && ghSync.syncedAssetsCount > 0
+                  ? 'text-emerald-300'
+                  : ghSync?.status === 'error'
+                  ? 'text-rose-300'
+                  : 'text-slate-400'
+              }`}
+            >
+              {githubRepoFeedback || ghSync?.message}
+            </p>
+          )}
+        </div>
+
         {/* OS Platform Tabs */}
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
           {(
@@ -233,6 +360,7 @@ export const LinuxInstallerView: React.FC = () => {
           ).map((tab) => {
             const Icon = tab.icon;
             const active = osTab === tab.id;
+            const hasCompiled = catalog?.artifacts.some((a) => a.os === tab.id && a.compiledOnServer);
             return (
               <button
                 key={tab.id}
@@ -253,9 +381,16 @@ export const LinuxInstallerView: React.FC = () => {
                 >
                   <Icon className="h-5 w-5" />
                 </div>
-                <div className="min-w-0">
-                  <div className={`font-display text-sm font-semibold ${active ? 'text-amber-100' : 'text-slate-200'}`}>
-                    {tab.label}
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className={`font-display text-sm font-semibold ${active ? 'text-amber-100' : 'text-slate-200'}`}>
+                      {tab.label}
+                    </span>
+                    {hasCompiled && (
+                      <span className="font-mono text-[9px] uppercase text-emerald-300">
+                        Compilado
+                      </span>
+                    )}
                   </div>
                   <div className="text-[11px] text-slate-400 truncate">{tab.detail}</div>
                 </div>
@@ -273,7 +408,7 @@ export const LinuxInstallerView: React.FC = () => {
                   Pré-configurar Código de Pareamento dentro do App Android (opcional)
                 </p>
                 <p className="text-[11px] text-slate-400">
-                  Gere um código de 6 dígitos antes de baixar o projeto Android: ele já vem gravado em <code className="text-slate-200">AegisConfig.kt</code> junto com a URL deste servidor.
+                  Gere um código de 6 dígitos antes de baixar o projeto Android: ele já vem gravado em <code className="text-slate-200">AegisConfig.kt</code> junto com a URL deste servidor (ou digite o código ao abrir o <code className="text-slate-200">.APK</code>).
                 </p>
               </div>
               <div className="flex flex-wrap items-center gap-2">
@@ -298,7 +433,7 @@ export const LinuxInstallerView: React.FC = () => {
             {androidPairCode && (
               <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-emerald-400/40 bg-emerald-500/12 px-3.5 py-2 text-xs">
                 <span className="text-emerald-200">
-                  Código <strong className="font-mono text-white tracking-widest">{androidPairCode}</strong> será embutido automaticamente no download abaixo!
+                  Código <strong className="font-mono text-white tracking-widest">{androidPairCode}</strong> pronto para uso no app Android!
                 </span>
                 <button
                   type="button"
@@ -324,7 +459,7 @@ export const LinuxInstallerView: React.FC = () => {
             <span>{catalogError}</span>
             <button
               type="button"
-              onClick={() => void loadCatalog()}
+              onClick={() => void loadCatalog(true)}
               className="rounded-lg bg-rose-500 px-3 py-1.5 font-semibold text-slate-950 cursor-pointer"
             >
               Tentar novamente
@@ -333,8 +468,9 @@ export const LinuxInstallerView: React.FC = () => {
         ) : (
           <div className="space-y-4">
             {visibleArtifacts.map((art, index) => {
+              const isExternal = /^https?:\/\//i.test(art.downloadUrl);
               const downloadHref =
-                art.os === 'android' && androidPairCode
+                !isExternal && art.os === 'android' && androidPairCode
                   ? `${art.downloadUrl}?code=${encodeURIComponent(androidPairCode)}`
                   : art.downloadUrl;
               const isPrimary = index === 0;
@@ -356,9 +492,17 @@ export const LinuxInstallerView: React.FC = () => {
                         <h3 className="font-display text-sm sm:text-base font-semibold text-slate-100">
                           {art.title}
                         </h3>
-                        {art.compiledOnServer && (
+                        {art.source === 'github_release' ? (
+                          <span className="font-mono text-[10px] uppercase tracking-wider text-sky-300 border border-sky-500/40 bg-sky-500/12 px-2 py-0.5 rounded">
+                            Binário Compilado · GitHub Release
+                          </span>
+                        ) : art.compiledOnServer ? (
                           <span className="font-mono text-[10px] uppercase tracking-wider text-emerald-300 border border-emerald-500/35 bg-emerald-500/10 px-2 py-0.5 rounded">
                             Compilado no Servidor
+                          </span>
+                        ) : (
+                          <span className="font-mono text-[10px] uppercase tracking-wider text-amber-300 border border-amber-500/35 bg-amber-500/10 px-2 py-0.5 rounded">
+                            Kit Nativo Pronto p/ Build
                           </span>
                         )}
                       </div>
@@ -367,7 +511,9 @@ export const LinuxInstallerView: React.FC = () => {
 
                     <a
                       href={downloadHref}
-                      download={art.filename}
+                      download={isExternal ? undefined : art.filename}
+                      target={isExternal ? '_blank' : undefined}
+                      rel={isExternal ? 'noopener noreferrer' : undefined}
                       className={`inline-flex items-center gap-2 rounded-xl px-4 py-2.5 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
                         isPrimary
                           ? 'bg-amber-500 text-slate-950 hover:bg-amber-400'
@@ -390,9 +536,15 @@ export const LinuxInstallerView: React.FC = () => {
                       <span className="text-amber-300">{formatBytes(art.sizeBytes)}</span>
                     </div>
                     <div className="rounded-xl border border-white/8 bg-[#060910] px-3 py-2">
-                      <span className="text-slate-500 block">SHA-256</span>
-                      <span className="text-slate-300 truncate block" title={art.sha256 || ''}>
-                        {art.sha256 ? `${art.sha256.slice(0, 18)}…` : 'Gerado sob demanda'}
+                      <span className="text-slate-500 block">
+                        {art.source === 'github_release' ? 'Release' : 'SHA-256'}
+                      </span>
+                      <span className="text-slate-300 truncate block" title={art.sha256 || art.releaseTag || ''}>
+                        {art.sha256
+                          ? `${art.sha256.slice(0, 18)}…`
+                          : art.releaseTag
+                          ? `${art.releaseTag} (GitHub)`
+                          : 'Gerado sob demanda'}
                       </span>
                     </div>
                   </div>

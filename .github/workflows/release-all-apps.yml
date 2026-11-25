@@ -1,0 +1,175 @@
+name: Build & Release All Native Apps (Android, Windows, Linux)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Tag da Release (ex: v2.1.0)'
+        required: false
+        default: 'v2.1.0'
+      server_origin:
+        description: 'URL do servidor Aegis (opcional, ex: https://seu-app.run.app)'
+        required: false
+        default: 'https://aegis.local'
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-android-apk:
+    name: Compile Android (.APK)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Node dependencies
+        run: npm ci || npm install
+
+      - name: Export Android Kotlin project
+        run: npx tsx scripts/export-native-kits.ts --target android --out build-kits --origin "${{ inputs.server_origin || 'https://aegis.local' }}"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.10.2
+
+      - name: Compile Aegis Android APK
+        working-directory: build-kits/android/AegisAndroid-Native-2.1.0
+        run: |
+          gradle assembleDebug
+          mkdir -p ../../../dist-release
+          cp app/build/outputs/apk/debug/app-debug.apk ../../../dist-release/AegisAndroid-2.1.0.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aegis-android-apk
+          path: dist-release/AegisAndroid-2.1.0.apk
+
+  build-windows-exe:
+    name: Compile Windows (.EXE)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Node dependencies
+        run: npm ci || npm install
+
+      - name: Export Windows native project
+        run: npx tsx scripts/export-native-kits.ts --target windows --out build-kits --origin "${{ inputs.server_origin || 'https://aegis.local' }}"
+
+      - name: Compile C# WinForms AegisDesktop.exe
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path dist-release | Out-Null
+          $csc = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+          $src = Get-ChildItem -Path build-kits\windows -Recurse -Filter "AegisDesktop.cs" | Select-Object -First 1
+          if (Test-Path $csc -and $src) {
+            & $csc /nologo /target:winexe /optimize+ /out:"dist-release\AegisDesktop-2.1.0.exe" /r:System.Windows.Forms.dll /r:System.Drawing.dll $src.FullName
+          }
+
+      - name: Build Electron NSIS Installer (.exe)
+        shell: powershell
+        run: |
+          $electronDir = Get-ChildItem -Path build-kits\windows -Recurse -Directory -Filter "electron-app" | Select-Object -First 1
+          if ($electronDir) {
+            Push-Location $electronDir.FullName
+            npm install
+            npm run build:win
+            Get-ChildItem -Path dist-installers -Filter "*.exe" | ForEach-Object {
+              Copy-Item $_.FullName -Destination "$env:GITHUB_WORKSPACE\dist-release\AegisDesktop-Setup-2.1.0.exe" -Force
+            }
+            Pop-Location
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aegis-windows-exe
+          path: dist-release/*.exe
+
+  build-linux-native:
+    name: Compile Linux (.DEB / .TAR.GZ / ELF / .AppImage)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Node dependencies
+        run: npm ci || npm install
+
+      - name: Compile Linux ELF, .DEB and .TAR.GZ
+        run: |
+          npx tsx scripts/export-native-kits.ts --target linux --out build-kits --origin "${{ inputs.server_origin || 'https://aegis.local' }}"
+          mkdir -p dist-release
+          cp build-kits/linux/aegis-desktop_2.1.0_amd64.deb dist-release/
+          cp build-kits/linux/aegis-desktop-linux-x64.tar.gz dist-release/
+          cp build-kits/linux/aegis-desktop dist-release/
+
+      - name: Build Linux AppImage (Electron)
+        run: |
+          mkdir -p /tmp/linux-extract
+          tar -xzf build-kits/linux/aegis-desktop-linux-x64.tar.gz -C /tmp/linux-extract
+          cd /tmp/linux-extract/aegis-desktop-2.1.0/electron-app
+          npm install
+          npx electron-builder --linux AppImage
+          cp dist-installers/*.AppImage "$GITHUB_WORKSPACE/dist-release/AegisDesktop-2.1.0.AppImage"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aegis-linux-packages
+          path: dist-release/*
+
+  publish-release:
+    name: Publish GitHub Release (Links to Download Buttons)
+    needs: [build-android-apk, build-windows-exe, build-linux-native]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        working-directory: release-assets
+        run: sha256sum * > SHA256SUMS.txt
+
+      - name: Determine Release Tag
+        id: tag
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${{ inputs.release_tag || 'v2.1.0' }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create or Update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: Aegis Native Apps ${{ steps.tag.outputs.name }}
+          make_latest: true
+          body: |
+            ## Aplicativos Nativos Compilados do Aegis (${{ steps.tag.outputs.name }})
+            - **Android**: `AegisAndroid-2.1.0.apk`
+            - **Windows 10/11**: `AegisDesktop-Setup-2.1.0.exe` e `AegisDesktop-2.1.0.exe`
+            - **Linux**: `aegis-desktop_2.1.0_amd64.deb`, `AegisDesktop-2.1.0.AppImage`, `aegis-desktop-linux-x64.tar.gz` e binário ELF `aegis-desktop`
+
+            Todos os binários acima são vinculados automaticamente aos botões de download na aba **Apps Nativos** do Aegis.
+          files: release-assets/*

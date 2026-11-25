@@ -20,8 +20,20 @@ export interface NativeArtifactMeta {
   sizeBytes: number | null;
   sha256: string | null;
   compiledOnServer: boolean;
+  source?: 'server_compiled' | 'github_release' | 'build_kit';
+  releaseTag?: string | null;
   installSteps: string[];
   capabilities: string[];
+}
+
+export interface GithubReleaseSyncInfo {
+  repo: string | null;
+  status: 'unconfigured' | 'linked' | 'no_releases' | 'error';
+  releaseTag: string | null;
+  releaseUrl: string | null;
+  publishedAt: string | null;
+  syncedAssetsCount: number;
+  message: string;
 }
 
 interface LinuxNativeCache {
@@ -2674,18 +2686,288 @@ Projeto Android nativo completo (\`com.aegis.agent\`) pre-configurado para o seu
 }
 
 // ============================================================================
-// 4. UNIFIED NATIVE INSTALLERS CATALOG
+// 4. GITHUB RELEASES AUTO-LINKING (COMPILED .APK / .EXE / .APPIMAGE / .DEB)
 // ============================================================================
 
-export async function getNativeInstallersCatalog(serverOrigin: string): Promise<{
+const GITHUB_REPO_RE = /^[a-zA-Z0-9._-]{1,60}\/[a-zA-Z0-9._-]{1,100}$/;
+
+export function normalizeGithubRepo(raw?: string | null): string | null {
+  const trimmed = String(raw || '').trim();
+  if (!trimmed) return null;
+  let candidate = trimmed
+    .replace(/^https?:\/\/(www\.)?github\.com\//i, '')
+    .replace(/\.git$/i, '')
+    .replace(/^\/+|\/+$/g, '');
+  const parts = candidate.split('/').filter(Boolean);
+  if (parts.length >= 2) {
+    candidate = `${parts[0]}/${parts[1]}`;
+  }
+  if (!GITHUB_REPO_RE.test(candidate) || candidate.includes('..')) {
+    return null;
+  }
+  return candidate;
+}
+
+interface GithubAssetRaw {
+  name: string;
+  browser_download_url: string;
+  size: number;
+  content_type?: string;
+}
+
+interface GithubReleaseRaw {
+  tag_name?: string;
+  html_url?: string;
+  published_at?: string;
+  assets?: GithubAssetRaw[];
+}
+
+interface GithubReleaseCacheEntry {
+  fetchedAt: number;
+  sync: GithubReleaseSyncInfo;
+  artifacts: NativeArtifactMeta[];
+}
+
+const githubReleaseCache = new Map<string, GithubReleaseCacheEntry>();
+const GITHUB_CACHE_TTL_MS = 5 * 60 * 1000;
+
+export function clearGithubReleaseCache(repo?: string): void {
+  if (repo) {
+    githubReleaseCache.delete(repo);
+  } else {
+    githubReleaseCache.clear();
+  }
+}
+
+async function fetchGithubReleaseArtifacts(
+  rawRepo?: string | null,
+  forceRefresh = false
+): Promise<{ sync: GithubReleaseSyncInfo; artifacts: NativeArtifactMeta[] }> {
+  const repo = normalizeGithubRepo(rawRepo);
+  if (!repo) {
+    return {
+      sync: {
+        repo: null,
+        status: 'unconfigured',
+        releaseTag: null,
+        releaseUrl: null,
+        publishedAt: null,
+        syncedAssetsCount: 0,
+        message:
+          'Vincule seu repositório GitHub (usuario/repositorio) para ligar automaticamente os binários finais (.apk, .exe e .AppImage) compilados via GitHub Actions aos botões de download.',
+      },
+      artifacts: [],
+    };
+  }
+
+  const cached = githubReleaseCache.get(repo);
+  if (!forceRefresh && cached && Date.now() - cached.fetchedAt < GITHUB_CACHE_TTL_MS) {
+    return { sync: cached.sync, artifacts: cached.artifacts };
+  }
+
+  const headers: Record<string, string> = {
+    Accept: 'application/vnd.github+json',
+    'User-Agent': `Aegis-Native-Catalog/${APP_VERSION}`,
+    'X-GitHub-Api-Version': '2022-11-28',
+  };
+  const ghToken = process.env.GITHUB_TOKEN?.trim();
+  if (ghToken) {
+    headers.Authorization = `Bearer ${ghToken}`;
+  }
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    const res = await fetch(`https://api.github.com/repos/${repo}/releases/latest`, {
+      headers,
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+
+    if (res.status === 404) {
+      const result = {
+        sync: {
+          repo,
+          status: 'no_releases' as const,
+          releaseTag: null,
+          releaseUrl: `https://github.com/${repo}/actions`,
+          publishedAt: null,
+          syncedAssetsCount: 0,
+          message: `Repositório ${repo} vinculado! Execute o workflow "Build & Release All Native Apps" na aba Actions do GitHub (ou crie a tag v${APP_VERSION}) para publicar o .apk e o .exe automaticamente.`,
+        },
+        artifacts: [],
+      };
+      githubReleaseCache.set(repo, { fetchedAt: Date.now(), ...result });
+      return result;
+    }
+
+    if (!res.ok) {
+      const result = {
+        sync: {
+          repo,
+          status: 'error' as const,
+          releaseTag: null,
+          releaseUrl: `https://github.com/${repo}/releases`,
+          publishedAt: null,
+          syncedAssetsCount: 0,
+          message: `Não foi possível consultar Releases de ${repo} (HTTP ${res.status}). Se o repositório for privado, configure GITHUB_TOKEN no servidor.`,
+        },
+        artifacts: [],
+      };
+      githubReleaseCache.set(repo, { fetchedAt: Date.now(), ...result });
+      return result;
+    }
+
+    const release = (await res.json()) as GithubReleaseRaw;
+    const tag = release.tag_name || `v${APP_VERSION}`;
+    const releaseUrl = release.html_url || `https://github.com/${repo}/releases/latest`;
+    const assets = Array.isArray(release.assets) ? release.assets : [];
+
+    const mapped: NativeArtifactMeta[] = [];
+
+    for (const asset of assets) {
+      const name = String(asset.name || '');
+      const url = String(asset.browser_download_url || '');
+      if (!name || !/^https:\/\/github\.com\//i.test(url)) continue;
+      const lower = name.toLowerCase();
+
+      if (lower.endsWith('.apk')) {
+        mapped.push({
+          id: `gh-android-${name}`,
+          os: 'android',
+          filename: name,
+          title: `Aegis Android — Instalador Compilado (${tag})`,
+          subtitle: `APK nativo compilado via GitHub Actions (${repo}) pronto para instalar direto no celular Android`,
+          format: '.apk (Android Compilado)',
+          architecture: 'Android 8.0+ (arm64 / universal)',
+          downloadUrl: url,
+          sizeBytes: Number.isFinite(asset.size) ? asset.size : null,
+          sha256: null,
+          compiledOnServer: true,
+          source: 'github_release',
+          releaseTag: tag,
+          installSteps: [
+            `Baixe ${name} diretamente no celular Android`,
+            'Toque no arquivo baixado e permita "Instalar apps desconhecidos" se solicitado',
+            'Abra o Aegis Android, informe seu código de pareamento e ative Acessibilidade + Notificações',
+          ],
+          capabilities: [
+            'Binário .APK final compilado automaticamente (pronto para instalar sem Android Studio)',
+            'ForegroundService persistente + AccessibilityService + NotificationListener',
+            `Publicação verificada na Release ${tag} de ${repo}`,
+          ],
+        });
+      } else if (lower.endsWith('.exe') || lower.endsWith('.msi')) {
+        const isSetup = lower.includes('setup') || lower.endsWith('.msi');
+        mapped.push({
+          id: `gh-windows-${name}`,
+          os: 'windows',
+          filename: name,
+          title: isSetup
+            ? `Aegis Desktop Windows — Instalador Compilado (${tag})`
+            : `Aegis Desktop Windows — Executável Nativo (${tag})`,
+          subtitle: `Binário Windows PE32+ compilado via GitHub Actions (${repo}) pronto para executar no Windows 10/11`,
+          format: lower.endsWith('.msi') ? '.msi (Windows Installer)' : '.exe (Win64 Compilado)',
+          architecture: 'x64 (Windows 10/11)',
+          downloadUrl: url,
+          sizeBytes: Number.isFinite(asset.size) ? asset.size : null,
+          sha256: null,
+          compiledOnServer: true,
+          source: 'github_release',
+          releaseTag: tag,
+          installSteps: [
+            `Baixe e execute ${name} no Windows 10 ou 11`,
+            'Se o SmartScreen perguntar, clique em "Mais informações" -> "Executar assim mesmo"',
+            'Use o ícone do Aegis na Bandeja do Sistema ou Menu Iniciar',
+          ],
+          capabilities: [
+            'Executável Windows compilado pronto para instalar com 1 clique',
+            'Bandeja do sistema + serviço local (127.0.0.1:3847) + ponte ADB Android',
+            `Publicação verificada na Release ${tag} de ${repo}`,
+          ],
+        });
+      } else if (lower.endsWith('.appimage') || lower.endsWith('.rpm')) {
+        mapped.push({
+          id: `gh-linux-${name}`,
+          os: 'linux',
+          filename: name,
+          title: `Aegis Desktop Linux — ${lower.endsWith('.appimage') ? 'AppImage Portátil' : 'Pacote RPM'} (${tag})`,
+          subtitle: `Binário Linux compilado via GitHub Actions (${repo})`,
+          format: lower.endsWith('.appimage') ? '.AppImage (Portátil)' : '.rpm (Fedora/openSUSE)',
+          architecture: 'x86_64',
+          downloadUrl: url,
+          sizeBytes: Number.isFinite(asset.size) ? asset.size : null,
+          sha256: null,
+          compiledOnServer: true,
+          source: 'github_release',
+          releaseTag: tag,
+          installSteps: lower.endsWith('.appimage')
+            ? [`chmod +x ${name}`, `./${name}`]
+            : [`sudo dnf install ./${name}`, 'Abra "Aegis Desktop" no menu do sistema'],
+          capabilities: [
+            'Pacote desktop compilado com interface nativa Electron + daemon local embutido',
+            `Publicação verificada na Release ${tag} de ${repo}`,
+          ],
+        });
+      }
+    }
+
+    const result = {
+      sync: {
+        repo,
+        status: 'linked' as const,
+        releaseTag: tag,
+        releaseUrl,
+        publishedAt: release.published_at || null,
+        syncedAssetsCount: mapped.length,
+        message:
+          mapped.length > 0
+            ? `Release ${tag} sincronizada (${mapped.length} binário(s) final(is) vinculados diretamente aos botões de download).`
+            : `Release ${tag} encontrada em ${repo}, mas sem anexos .apk/.exe/.AppImage ainda. Rode o workflow release-all-apps.yml.`,
+      },
+      artifacts: mapped,
+    };
+    githubReleaseCache.set(repo, { fetchedAt: Date.now(), ...result });
+    return result;
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : 'Erro de rede ao consultar GitHub Releases.';
+    return {
+      sync: {
+        repo,
+        status: 'error',
+        releaseTag: null,
+        releaseUrl: `https://github.com/${repo}/releases`,
+        publishedAt: null,
+        syncedAssetsCount: 0,
+        message: `Falha ao consultar ${repo}: ${msg}`,
+      },
+      artifacts: [],
+    };
+  }
+}
+
+// ============================================================================
+// 5. UNIFIED NATIVE INSTALLERS CATALOG
+// ============================================================================
+
+export async function getNativeInstallersCatalog(
+  serverOrigin: string,
+  options?: { githubRepo?: string | null; forceRefresh?: boolean }
+): Promise<{
   version: string;
   builtAt: string;
+  githubSync: GithubReleaseSyncInfo;
   artifacts: NativeArtifactMeta[];
 }> {
   const safeOrigin = sanitizeOrigin(serverOrigin);
   const linux = buildLinuxNativeArtifacts();
   const win = await buildWindowsNativePackageZip(safeOrigin);
   const android = await buildAndroidNativeProjectZip(safeOrigin);
+  const gh = await fetchGithubReleaseArtifacts(options?.githubRepo, options?.forceRefresh);
+
+  const ghLinux = gh.artifacts.filter((a) => a.os === 'linux');
+  const ghWindows = gh.artifacts.filter((a) => a.os === 'windows');
+  const ghAndroid = gh.artifacts.filter((a) => a.os === 'android');
 
   const artifacts: NativeArtifactMeta[] = [
     {
@@ -2700,6 +2982,7 @@ export async function getNativeInstallersCatalog(serverOrigin: string): Promise<
       sizeBytes: linux.debBuffer.length,
       sha256: linux.debSha256,
       compiledOnServer: true,
+      source: 'server_compiled',
       installSteps: [
         `sudo apt install ./aegis-desktop_${APP_VERSION}_amd64.deb`,
         'Abra "Aegis Desktop" no menu de aplicativos do sistema ou execute: aegis-desktop',
@@ -2711,6 +2994,7 @@ export async function getNativeInstallersCatalog(serverOrigin: string): Promise<
         'Servico de usuario systemd (--user) + ponte ADB Android',
       ],
     },
+    ...ghLinux,
     {
       id: 'linux-tar',
       os: 'linux',
@@ -2723,6 +3007,7 @@ export async function getNativeInstallersCatalog(serverOrigin: string): Promise<
       sizeBytes: linux.tarGzBuffer.length,
       sha256: linux.tarGzSha256,
       compiledOnServer: true,
+      source: 'server_compiled',
       installSteps: [
         'tar -xzf aegis-desktop-linux-x64.tar.gz',
         `cd aegis-desktop-${APP_VERSION} && ./install-native-linux.sh`,
@@ -2746,6 +3031,7 @@ export async function getNativeInstallersCatalog(serverOrigin: string): Promise<
       sizeBytes: linux.elfBuffer.length,
       sha256: linux.elfSha256,
       compiledOnServer: true,
+      source: 'server_compiled',
       installSteps: [
         'chmod +x aegis-desktop',
         './aegis-desktop --doctor',
@@ -2755,11 +3041,12 @@ export async function getNativeInstallersCatalog(serverOrigin: string): Promise<
         'Suporta --ui, --status, --start, --stop, --doctor e CLI',
       ],
     },
+    ...ghWindows,
     {
       id: 'windows-native',
       os: 'windows',
       filename: `AegisDesktop-Windows-Native-${APP_VERSION}.zip`,
-      title: 'Aegis Desktop Nativo para Windows 10 / 11 (AegisDesktop.exe)',
+      title: 'Aegis Desktop Nativo para Windows 10 / 11 (Kit Compilação Local -> AegisDesktop.exe)',
       subtitle: 'Aplicativo C# WinForms com bandeja do sistema + compilacao nativa zero-SDK (csc.exe) + projeto NSIS/MSI',
       format: 'AegisDesktop.exe (C# WinForms + NSIS)',
       architecture: 'x64 (Windows 10/11)',
@@ -2767,10 +3054,11 @@ export async function getNativeInstallersCatalog(serverOrigin: string): Promise<
       sizeBytes: win.buffer.length,
       sha256: win.sha256,
       compiledOnServer: false,
+      source: 'build_kit',
       installSteps: [
         `Extraia AegisDesktop-Windows-Native-${APP_VERSION}.zip`,
         'De clique duplo em Instalar-Aegis-Windows.cmd (compila AegisDesktop.exe nativamente com o .NET do Windows)',
-        'Use pelo icone na Bandeja do Sistema, Menu Iniciar ou Aplicativos Instalados',
+        'Ou rode o GitHub Actions (.github/workflows/release-all-apps.yml) e vincule o repositorio acima para baixar o .exe pronto',
       ],
       capabilities: [
         'Gera AegisDesktop.exe real (PE32+ WinForms) + AegisUninstall.exe',
@@ -2778,6 +3066,7 @@ export async function getNativeInstallersCatalog(serverOrigin: string): Promise<
         'Inclui Electron + electron-builder (NSIS .exe / .msi) e Inno Setup (.iss)',
       ],
     },
+    ...ghAndroid,
     {
       id: 'android-native',
       os: 'android',
@@ -2790,10 +3079,11 @@ export async function getNativeInstallersCatalog(serverOrigin: string): Promise<
       sizeBytes: android.buffer.length,
       sha256: android.sha256,
       compiledOnServer: false,
+      source: 'build_kit',
       installSteps: [
-        'Opcional: gere um codigo de pareamento de 6 digitos abaixo para ja embutir no app',
-        `Extraia AegisAndroid-Native-${APP_VERSION}.zip`,
-        'Gere o .APK no Android Studio (Build -> Build APK), via ./build-apk.sh ou em 1 clique no GitHub Actions (.github/workflows/build-android-apk.yml)',
+        'Para baixar o .APK ja compilado direto aqui: suba o repositorio para o GitHub, execute o workflow release-all-apps.yml e vincule usuario/repositorio no topo',
+        `Ou extraia AegisAndroid-Native-${APP_VERSION}.zip (com codigo de pareamento opcional ja embutido)`,
+        'Compile no Android Studio (Build -> Build APK) ou rodando ./build-apk.sh',
       ],
       capabilities: [
         'App nativo Android (nao e webapp): servico persistente + boot automatico',
@@ -2806,6 +3096,7 @@ export async function getNativeInstallersCatalog(serverOrigin: string): Promise<
   return {
     version: APP_VERSION,
     builtAt: linux.builtAt,
+    githubSync: gh.sync,
     artifacts,
   };
 }

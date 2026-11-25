@@ -26,6 +26,13 @@ function extractBearerToken(req: Request): string | null {
 
 async function startServer() {
   const app = express();
+  app.disable('x-powered-by');
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('Permissions-Policy', 'camera=(), geolocation=()');
+    next();
+  });
   app.use(express.json({ limit: '4mb' }));
 
   // ==========================================
@@ -79,25 +86,55 @@ async function startServer() {
     return res.json({ user: auth.sanitizeUser(user), sessionToken });
   });
 
-  app.post('/api/auth/google-sso', (req: Request, res: Response) => {
-    const { email, displayName } = req.body as { email?: string; displayName?: string };
-    if (!email?.trim()) {
-      return res.status(400).json({ error: 'E-mail Google obrigatório para SSO.' });
+  app.post('/api/auth/google-sso', async (req: Request, res: Response) => {
+    const bearer = extractBearerToken(req);
+    const bodyToken = typeof req.body?.accessToken === 'string' ? req.body.accessToken.trim() : '';
+    const googleAccessToken = bearer || bodyToken;
+    if (!googleAccessToken) {
+      return res.status(401).json({ error: 'Token OAuth do Google obrigatório para validação SSO.' });
     }
-    let user = memory.findUserByIdentifier(email);
-    if (!user) {
-      const baseUser = email.split('@')[0].replace(/[^a-zA-Z0-9_.-]/g, '') || `user_${Date.now()}`;
-      const uniqueUser = memory.findUserByIdentifier(baseUser) ? `${baseUser}_${Date.now().toString().slice(-4)}` : baseUser;
-      user = memory.createUser({
-        username: uniqueUser,
-        email: email.trim(),
-        displayName: displayName?.trim() || email.trim(),
-        passwordHash: '',
-        authProvider: 'google',
+
+    try {
+      const verifyRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+        headers: { Authorization: `Bearer ${googleAccessToken}` },
       });
+      if (!verifyRes.ok) {
+        return res.status(401).json({ error: 'Token Google inválido ou expirado.' });
+      }
+      const profile = (await verifyRes.json()) as {
+        email?: string;
+        email_verified?: boolean;
+        name?: string;
+      };
+      const verifiedEmail = profile.email?.trim().toLowerCase();
+      if (!verifiedEmail || profile.email_verified === false) {
+        return res.status(401).json({ error: 'Conta Google sem e-mail verificado.' });
+      }
+
+      const displayName =
+        profile.name?.trim() ||
+        (typeof req.body?.displayName === 'string' ? req.body.displayName.trim() : '') ||
+        verifiedEmail;
+
+      let user = memory.findUserByIdentifier(verifiedEmail);
+      if (!user) {
+        const baseUser = verifiedEmail.split('@')[0].replace(/[^a-zA-Z0-9_.-]/g, '') || `user_${Date.now()}`;
+        const uniqueUser = memory.findUserByIdentifier(baseUser)
+          ? `${baseUser}_${Date.now().toString().slice(-4)}`
+          : baseUser;
+        user = memory.createUser({
+          username: uniqueUser,
+          email: verifiedEmail,
+          displayName,
+          passwordHash: '',
+          authProvider: 'google',
+        });
+      }
+      const sessionToken = auth.issueSession(res, user.id);
+      return res.json({ user: auth.sanitizeUser(user), sessionToken });
+    } catch {
+      return res.status(502).json({ error: 'Falha ao verificar identidade com os servidores do Google.' });
     }
-    const sessionToken = auth.issueSession(res, user.id);
-    return res.json({ user: auth.sanitizeUser(user), sessionToken });
   });
 
   app.post('/api/auth/logout', (req: Request, res: Response) => {
@@ -1097,13 +1134,56 @@ async function startServer() {
   // NATIVE OS APPLICATION PACKAGES (LINUX / WINDOWS / ANDROID)
   // ==========================================
 
+  const getConfiguredGithubRepo = (): string | null => {
+    const stored = memory.getAppSetting('github_repo');
+    if (stored) return nativePackages.normalizeGithubRepo(stored);
+    return nativePackages.normalizeGithubRepo(process.env.AEGIS_GITHUB_REPO);
+  };
+
   app.get('/api/installers/catalog', async (req: Request, res: Response) => {
     try {
-      const catalog = await nativePackages.getNativeInstallersCatalog(getServerOrigin(req));
+      const forceRefresh = req.query.refresh === '1' || req.query.refresh === 'true';
+      const catalog = await nativePackages.getNativeInstallersCatalog(getServerOrigin(req), {
+        githubRepo: getConfiguredGithubRepo(),
+        forceRefresh,
+      });
       return res.json(catalog);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Falha ao compilar catalogo de aplicativos nativos.';
       console.error('Native installers catalog error:', err);
+      return res.status(500).json({ error: msg });
+    }
+  });
+
+  app.post('/api/installers/github-repo', auth.requireAuth, async (req: Request, res: Response) => {
+    try {
+      const rawRepo = typeof req.body?.repo === 'string' ? req.body.repo.trim() : '';
+      if (!rawRepo) {
+        memory.setAppSetting('github_repo', null);
+        nativePackages.clearGithubReleaseCache();
+        const catalog = await nativePackages.getNativeInstallersCatalog(getServerOrigin(req), {
+          githubRepo: nativePackages.normalizeGithubRepo(process.env.AEGIS_GITHUB_REPO),
+          forceRefresh: true,
+        });
+        return res.json({ ok: true, catalog });
+      }
+
+      const normalized = nativePackages.normalizeGithubRepo(rawRepo);
+      if (!normalized) {
+        return res.status(400).json({
+          error: 'Informe um repositório GitHub válido no formato usuario/repositorio ou URL https://github.com/usuario/repositorio.',
+        });
+      }
+
+      memory.setAppSetting('github_repo', normalized);
+      nativePackages.clearGithubReleaseCache(normalized);
+      const catalog = await nativePackages.getNativeInstallersCatalog(getServerOrigin(req), {
+        githubRepo: normalized,
+        forceRefresh: true,
+      });
+      return res.json({ ok: true, repo: normalized, catalog });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Falha ao vincular repositório GitHub.';
       return res.status(500).json({ error: msg });
     }
   });
@@ -1452,7 +1532,7 @@ async function startServer() {
     const code = typeof req.query.code === 'string' ? nativePackages.sanitizePairingCode(req.query.code) : '';
     const pkg = await nativePackages.buildAndroidNativeProjectZip(getServerOrigin(req), code);
     res.setHeader('Content-Type', 'application/zip');
-    res.setHeader('Content-Disposition', 'attachment; filename="AegisAndroid-Native-2.0.0.zip"');
+    res.setHeader('Content-Disposition', 'attachment; filename="AegisAndroid-Native-2.1.0.zip"');
     res.setHeader('X-Content-SHA256', pkg.sha256);
     return res.send(pkg.buffer);
   });
@@ -1461,10 +1541,18 @@ async function startServer() {
   // VITE / STATIC SERVING ON PORT 3000
   // ==========================================
 
+  const PORT = 3000;
+  const httpServer = http.createServer(app);
+
   const isProd = process.env.NODE_ENV === 'production';
   if (!isProd) {
+    const hmrDisabled = process.env.DISABLE_HMR === 'true';
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: !hmrDisabled,
+        ws: { server: httpServer },
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -1476,8 +1564,6 @@ async function startServer() {
     });
   }
 
-  const PORT = 3000;
-  const httpServer = http.createServer(app);
   attachLiveWebSocketServer(httpServer);
   deviceHub.attachDeviceWebSocketServer(httpServer);
   httpServer.listen(PORT, '0.0.0.0', () => {

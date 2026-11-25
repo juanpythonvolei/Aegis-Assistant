@@ -48,7 +48,10 @@ ensureWorkspaceSeeded();
 export function resolveSafePath(relativePath = '.'): string {
   const cleaned = relativePath.replace(/^~\/?/, '').replace(/^\/+/, '');
   const target = path.resolve(LINUX_WORKSPACE_ROOT, cleaned || '.');
-  if (!target.startsWith(LINUX_WORKSPACE_ROOT)) {
+  const rootPrefix = LINUX_WORKSPACE_ROOT.endsWith(path.sep)
+    ? LINUX_WORKSPACE_ROOT
+    : `${LINUX_WORKSPACE_ROOT}${path.sep}`;
+  if (target !== LINUX_WORKSPACE_ROOT && !target.startsWith(rootPrefix)) {
     throw new Error('Caminho fora do diretório de trabalho local permitido.');
   }
   return target;
@@ -380,11 +383,21 @@ export async function runLinuxCommand(command: string): Promise<{
   }
 
   try {
+    const safeEnv: NodeJS.ProcessEnv = {
+      PATH: process.env.PATH || '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+      HOME: LINUX_WORKSPACE_ROOT,
+      USER: process.env.USER || 'aegis',
+      SHELL: process.env.SHELL || '/bin/sh',
+      TERM: process.env.TERM || 'xterm-256color',
+      TMPDIR: process.env.TMPDIR || '/tmp',
+      LANG: 'C.UTF-8',
+      LC_ALL: 'C.UTF-8',
+    };
     const { stdout, stderr } = await execAsync(command, {
       cwd: LINUX_WORKSPACE_ROOT,
       timeout: 12000,
       maxBuffer: 512 * 1024,
-      env: { ...process.env, LANG: 'C.UTF-8' },
+      env: safeEnv,
     });
     return {
       stdout: stdout.trim(),

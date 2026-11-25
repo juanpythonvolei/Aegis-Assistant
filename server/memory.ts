@@ -420,6 +420,12 @@ db.exec(`
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY (routine_id) REFERENCES web_routines(id) ON DELETE SET NULL
   );
+
+  CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
 `);
 
 const ruleCountRow = db.prepare('SELECT COUNT(*) as count FROM proactive_rules').get() as { count: number };
@@ -1503,5 +1509,25 @@ export function listWebRoutineRuns(routineId?: number, limit = 25): WebRoutineRu
     .prepare('SELECT * FROM web_routine_runs ORDER BY id DESC LIMIT ?')
     .all(limit) as WebRoutineRunRecord[];
 }
+
+export function getAppSetting(key: string): string | null {
+  const row = db
+    .prepare('SELECT value FROM app_settings WHERE key = ? LIMIT 1')
+    .get(key) as { value: string } | undefined;
+  return row ? row.value : null;
+}
+
+export function setAppSetting(key: string, value: string | null): void {
+  if (value === null || value === '') {
+    db.prepare('DELETE FROM app_settings WHERE key = ?').run(key);
+    return;
+  }
+  db.prepare(`
+    INSERT INTO app_settings (key, value, updated_at)
+    VALUES (?, ?, datetime('now'))
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')
+  `).run(key, value);
+}
+
 
 

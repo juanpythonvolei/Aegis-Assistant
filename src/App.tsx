@@ -552,12 +552,14 @@ export default function App() {
       const res = await googleSignIn();
       setGoogleUser(res.user);
       setAccessToken(res.accessToken);
-      if (res.user.email) {
+      if (res.user.email && res.accessToken) {
         const ssoRes = await apiFetch('/api/auth/google-sso', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${res.accessToken}`,
+          },
           body: JSON.stringify({
-            email: res.user.email,
             displayName: res.user.displayName || res.user.email,
           }),
         });
@@ -566,6 +568,9 @@ export default function App() {
           setAegisSessionToken(ssoData.sessionToken);
           setAegisUser(ssoData.user);
           await refreshAuthAndUsage();
+        } else {
+          const errData = await ssoRes.json().catch(() => ({}));
+          setAuthError(errData.error || 'Falha ao validar sessão Google no servidor.');
         }
       }
     } catch (err: unknown) {
