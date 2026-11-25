@@ -1,0 +1,6 @@
+{
+  "name": "Aegis — Assistente Linux & Google Workspace",
+  "description": "Assistente pessoal de IA com Gemini, memória persistente, automação local Linux e integração nativa com Google Workspace.",
+  "requestFramePermissions": ["microphone", "camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
