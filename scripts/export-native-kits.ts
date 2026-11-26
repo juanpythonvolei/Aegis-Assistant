@@ -79,9 +79,12 @@ async function main() {
     fs.mkdirSync(linuxDir, { recursive: true });
     const linuxArtifacts = nativePackages.buildLinuxNativeArtifacts();
     fs.writeFileSync(path.join(linuxDir, 'aegis-desktop_2.1.0_amd64.deb'), linuxArtifacts.debBuffer);
+    fs.writeFileSync(path.join(linuxDir, 'AegisDesktop-2.1.0-x86_64.AppImage'), linuxArtifacts.appImageBuffer, {
+      mode: 0o755,
+    });
     fs.writeFileSync(path.join(linuxDir, 'aegis-desktop-linux-x64.tar.gz'), linuxArtifacts.tarGzBuffer);
     fs.writeFileSync(path.join(linuxDir, 'aegis-desktop'), linuxArtifacts.elfBuffer, { mode: 0o755 });
-    console.log(`[export] Linux compiled artifacts (.deb, .tar.gz, ELF) -> ${linuxDir}`);
+    console.log(`[export] Linux compiled artifacts (.deb, .AppImage, .tar.gz, ELF) -> ${linuxDir}`);
   }
 }
 

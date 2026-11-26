@@ -114,22 +114,25 @@ jobs:
       - name: Install Node dependencies
         run: npm ci || npm install
 
-      - name: Compile Linux ELF, .DEB and .TAR.GZ
+      - name: Compile Linux ELF, .DEB, .AppImage and .TAR.GZ
         run: |
           npx tsx scripts/export-native-kits.ts --target linux --out build-kits --origin "${{ inputs.server_origin || 'https://aegis.local' }}"
           mkdir -p dist-release
           cp build-kits/linux/aegis-desktop_2.1.0_amd64.deb dist-release/
+          cp build-kits/linux/AegisDesktop-2.1.0-x86_64.AppImage dist-release/
+          chmod +x dist-release/AegisDesktop-2.1.0-x86_64.AppImage
           cp build-kits/linux/aegis-desktop-linux-x64.tar.gz dist-release/
           cp build-kits/linux/aegis-desktop dist-release/
 
-      - name: Build Linux AppImage (Electron)
+      - name: Build Linux Electron AppImage (Optional)
+        continue-on-error: true
         run: |
           mkdir -p /tmp/linux-extract
           tar -xzf build-kits/linux/aegis-desktop-linux-x64.tar.gz -C /tmp/linux-extract
           cd /tmp/linux-extract/aegis-desktop-2.1.0/electron-app
           npm install
           npx electron-builder --linux AppImage
-          cp dist-installers/*.AppImage "$GITHUB_WORKSPACE/dist-release/AegisDesktop-2.1.0.AppImage"
+          cp dist-installers/*.AppImage "$GITHUB_WORKSPACE/dist-release/AegisDesktop-Electron-2.1.0.AppImage"
 
       - uses: actions/upload-artifact@v4
         with:

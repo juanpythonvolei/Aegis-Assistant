@@ -273,7 +273,7 @@ export const LinuxInstallerView: React.FC = () => {
                 )}
               </div>
               <p className="text-xs text-slate-400 leading-relaxed">
-                Linux (<code className="text-amber-300">.deb</code> / ELF) já é compilado diretamente neste servidor. Para vincular o <strong className="text-slate-200">.APK Android</strong> e o <strong className="text-slate-200">.EXE Windows</strong> compilados pelo workflow <code className="text-sky-300">.github/workflows/release-all-apps.yml</code> diretamente aos botões abaixo, informe seu repositório GitHub:
+                Linux (<code className="text-amber-300">.deb</code>, <code className="text-amber-300">.AppImage</code> e ELF) já é compilado diretamente neste servidor com a HUD Holográfica 3D embarcada. Para vincular o <strong className="text-slate-200">.APK Android</strong> e o <strong className="text-slate-200">.EXE Windows</strong> compilados pelo workflow <code className="text-sky-300">.github/workflows/release-all-apps.yml</code> diretamente aos botões abaixo, informe seu repositório GitHub:
               </p>
             </div>
             {ghSync?.releaseUrl && (
@@ -341,7 +341,7 @@ export const LinuxInstallerView: React.FC = () => {
               {
                 id: 'linux',
                 label: 'Linux Nativo',
-                detail: 'Pacote .deb + ELF x86_64 + systemd',
+                detail: 'Pacote .deb + .AppImage + ELF x86_64',
                 icon: Terminal,
               },
               {

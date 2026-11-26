@@ -1204,6 +1204,25 @@ async function startServer() {
     }
   );
 
+  app.get(
+    [
+      '/api/installers/linux/AegisDesktop-2.1.0-x86_64.AppImage',
+      '/api/installers/linux/AegisDesktop-2.1.0.AppImage',
+    ],
+    (_req: Request, res: Response) => {
+      try {
+        const artifacts = nativePackages.buildLinuxNativeArtifacts();
+        res.setHeader('Content-Type', 'application/octet-stream');
+        res.setHeader('Content-Disposition', 'attachment; filename="AegisDesktop-2.1.0-x86_64.AppImage"');
+        res.setHeader('X-Content-SHA256', artifacts.appImageSha256);
+        return res.send(artifacts.appImageBuffer);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : 'Falha ao gerar pacote .AppImage.';
+        return res.status(500).json({ error: msg });
+      }
+    }
+  );
+
   app.get('/api/installers/linux/aegis-desktop-linux-x64.tar.gz', (_req: Request, res: Response) => {
     try {
       const artifacts = nativePackages.buildLinuxNativeArtifacts();

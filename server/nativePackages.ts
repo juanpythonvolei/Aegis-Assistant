@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import JSZip from 'jszip';
 import { getLinuxBundleFiles } from './linuxBundle.ts';
+import { getLocalHoloUiHtml } from './localHoloUi.ts';
 
 const BUILD_ROOT = '/tmp/aegis-native-build';
 const APP_VERSION = '2.1.0';
@@ -41,6 +42,8 @@ interface LinuxNativeCache {
   elfSha256: string;
   debBuffer: Buffer;
   debSha256: string;
+  appImageBuffer: Buffer;
+  appImageSha256: string;
   tarGzBuffer: Buffer;
   tarGzSha256: string;
   builtAt: string;
@@ -400,8 +403,8 @@ static int run_daemon_logged(const char *node_bin, const char *daemon_script, co
 static int start_daemon(const char *install_dir) {
   if (is_daemon_healthy()) return 0;
 
-  /* 1. Try systemd --user if present (non-blocking if unavailable) */
-  if (find_in_path("systemctl")) {
+  /* 1. Try systemd --user if present (skip when running portable AppImage so bundled runtime is used) */
+  if (getenv("APPIMAGE") == NULL && find_in_path("systemctl")) {
     char *sc_argv[] = {"systemctl", "--user", "start", "aegis-desktop.service", NULL};
     if (run_wait_quiet(sc_argv) == 0) {
       for (int i = 0; i < 16; i++) {
@@ -943,11 +946,307 @@ app.on('window-all-closed', () => {
   };
 }
 
+const AEGIS_APPIMAGE_RUNTIME_C = `/*
+ * Aegis Desktop Self-Contained AppImage Runtime (Linux x86_64 ELF, Zero-FUSE)
+ * Version ${APP_VERSION}
+ *
+ * - Funciona em qualquer distro Linux (Ubuntu 20-24, Debian, Pop!_OS, Fedora, Arch, Mint)
+ *   sem depender de libfuse2 ou privilegios root.
+ * - Layout do binario: [Runtime ELF] + [appdir.tar.gz] + [32B Trailer: "AEGIS_APPIMG_V01" + offset(LE64) + size(LE64)]
+ * - Flags suportadas: --appimage-version, --appimage-help, --appimage-extract, --integrate, --ui, --doctor, --status, --start, --stop
+ */
+#define _POSIX_C_SOURCE 200809L
+#include <errno.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#define APPIMG_VERSION "${APP_VERSION}"
+#define TRAILER_MAGIC "AEGIS_APPIMG_V01"
+#define TRAILER_SIZE 32
+
+static uint64_t read_le64(const unsigned char *b) {
+  uint64_t v = 0;
+  for (int i = 0; i < 8; i++) {
+    v |= ((uint64_t)b[i]) << (8 * i);
+  }
+  return v;
+}
+
+static int file_exists(const char *p) {
+  struct stat st;
+  return p && p[0] != '\\0' && stat(p, &st) == 0;
+}
+
+static int mkdir_p(const char *dir) {
+  char tmp[1024];
+  snprintf(tmp, sizeof(tmp), "%s", dir);
+  size_t len = strlen(tmp);
+  if (len == 0) return -1;
+  if (tmp[len - 1] == '/') tmp[len - 1] = '\\0';
+  for (char *p = tmp + 1; *p; p++) {
+    if (*p == '/') {
+      *p = '\\0';
+      mkdir(tmp, 0755);
+      *p = '/';
+    }
+  }
+  return (mkdir(tmp, 0755) == 0 || errno == EEXIST) ? 0 : -1;
+}
+
+static int read_trailer(const char *self_path, uint64_t *out_offset, uint64_t *out_size) {
+  FILE *f = fopen(self_path, "rb");
+  if (!f) return -1;
+  if (fseeko(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
+  off_t total = ftello(f);
+  if (total < TRAILER_SIZE) { fclose(f); return -1; }
+  if (fseeko(f, total - TRAILER_SIZE, SEEK_SET) != 0) { fclose(f); return -1; }
+  unsigned char trailer[TRAILER_SIZE];
+  if (fread(trailer, 1, TRAILER_SIZE, f) != TRAILER_SIZE) { fclose(f); return -1; }
+  fclose(f);
+
+  if (memcmp(trailer, TRAILER_MAGIC, 16) != 0) return -1;
+  uint64_t off = read_le64(trailer + 16);
+  uint64_t sz = read_le64(trailer + 24);
+  if (off == 0 || sz == 0 || (off_t)(off + sz + TRAILER_SIZE) > total) return -1;
+  *out_offset = off;
+  *out_size = sz;
+  return 0;
+}
+
+static int extract_payload_to(const char *self_path, uint64_t offset, uint64_t size, const char *dest_dir) {
+  if (mkdir_p(dest_dir) != 0) {
+    fprintf(stderr, "[Aegis AppImage] Falha ao criar diretorio: %s\\n", dest_dir);
+    return 1;
+  }
+
+  char tmp_tar[1200];
+  snprintf(tmp_tar, sizeof(tmp_tar), "%s/.aegis-payload-%ld.tar.gz", dest_dir, (long)getpid());
+
+  FILE *in = fopen(self_path, "rb");
+  if (!in) { perror("fopen(self)"); return 1; }
+  if (fseeko(in, (off_t)offset, SEEK_SET) != 0) { fclose(in); return 1; }
+
+  FILE *out = fopen(tmp_tar, "wb");
+  if (!out) { fclose(in); perror("fopen(tmp_tar)"); return 1; }
+
+  unsigned char buf[65536];
+  uint64_t rem = size;
+  while (rem > 0) {
+    size_t chunk = rem < sizeof(buf) ? (size_t)rem : sizeof(buf);
+    size_t n = fread(buf, 1, chunk, in);
+    if (n == 0) break;
+    if (fwrite(buf, 1, n, out) != n) {
+      fclose(in); fclose(out); unlink(tmp_tar);
+      return 1;
+    }
+    rem -= n;
+  }
+  fclose(in);
+  fclose(out);
+  if (rem != 0) {
+    unlink(tmp_tar);
+    fprintf(stderr, "[Aegis AppImage] Payload incompleto ao extrair.\\n");
+    return 1;
+  }
+
+  pid_t pid = fork();
+  if (pid < 0) { unlink(tmp_tar); return 1; }
+  if (pid == 0) {
+    char *tar_argv[] = {"tar", "-xzf", tmp_tar, "--strip-components=1", "-C", (char *)dest_dir, NULL};
+    execvp("tar", tar_argv);
+    _exit(127);
+  }
+  int status = 0;
+  waitpid(pid, &status, 0);
+  unlink(tmp_tar);
+  return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : 1;
+}
+
+static int ensure_cache_extracted(const char *self_path, uint64_t offset, uint64_t size, char *out_dir, size_t out_sz) {
+  const char *home = getenv("HOME");
+  if (home && home[0]) {
+    snprintf(out_dir, out_sz, "%s/.cache/aegis-appimage/%s", home, APPIMG_VERSION);
+  } else {
+    snprintf(out_dir, out_sz, "/tmp/aegis-appimage-%s", APPIMG_VERSION);
+  }
+
+  char stamp_path[1200];
+  char expected_stamp[128];
+  char apprun_path[1200];
+  char ui_path[1200];
+  snprintf(stamp_path, sizeof(stamp_path), "%s/.stamp", out_dir);
+  snprintf(apprun_path, sizeof(apprun_path), "%s/AppRun", out_dir);
+  snprintf(ui_path, sizeof(ui_path), "%s/opt/aegis/ui.html", out_dir);
+  snprintf(expected_stamp, sizeof(expected_stamp), "%llu:%llu", (unsigned long long)offset, (unsigned long long)size);
+
+  if (file_exists(apprun_path) && file_exists(ui_path)) {
+    FILE *sf = fopen(stamp_path, "r");
+    if (sf) {
+      char got[128] = "";
+      if (fgets(got, sizeof(got), sf)) {
+        got[strcspn(got, "\\r\\n")] = '\\0';
+        if (strcmp(got, expected_stamp) == 0) {
+          fclose(sf);
+          return 0;
+        }
+      }
+      fclose(sf);
+    }
+  }
+
+  if (extract_payload_to(self_path, offset, size, out_dir) != 0) {
+    return 1;
+  }
+
+  FILE *sf = fopen(stamp_path, "w");
+  if (sf) {
+    fprintf(sf, "%s\\n", expected_stamp);
+    fclose(sf);
+  }
+  return 0;
+}
+
+static int integrate_desktop(const char *self_path, const char *cache_dir) {
+  const char *home = getenv("HOME");
+  if (!home || !home[0]) {
+    fprintf(stderr, "[Aegis AppImage] HOME nao definido.\\n");
+    return 1;
+  }
+  char apps_dir[1024], icons_dir[1024], desktop_file[1200], icon_dest[1200], icon_src[1200];
+  snprintf(apps_dir, sizeof(apps_dir), "%s/.local/share/applications", home);
+  snprintf(icons_dir, sizeof(icons_dir), "%s/.local/share/icons/hicolor/scalable/apps", home);
+  mkdir_p(apps_dir);
+  mkdir_p(icons_dir);
+
+  snprintf(icon_src, sizeof(icon_src), "%s/aegis-desktop.svg", cache_dir);
+  snprintf(icon_dest, sizeof(icon_dest), "%s/aegis-desktop.svg", icons_dir);
+  FILE *fi = fopen(icon_src, "rb");
+  if (fi) {
+    FILE *fo = fopen(icon_dest, "wb");
+    if (fo) {
+      unsigned char b[8192];
+      size_t n;
+      while ((n = fread(b, 1, sizeof(b), fi)) > 0) fwrite(b, 1, n, fo);
+      fclose(fo);
+    }
+    fclose(fi);
+  }
+
+  snprintf(desktop_file, sizeof(desktop_file), "%s/aegis-desktop-appimage.desktop", apps_dir);
+  FILE *df = fopen(desktop_file, "w");
+  if (!df) { perror("fopen(desktop)"); return 1; }
+  fprintf(df,
+    "[Desktop Entry]\\n"
+    "Type=Application\\n"
+    "Version=1.0\\n"
+    "Name=Aegis Desktop (AppImage)\\n"
+    "GenericName=Orquestrador Neural Autonomo\\n"
+    "Comment=Aegis Desktop HUD Holografica 3D Portatil\\n"
+    "Exec=\\"%s\\" --ui\\n"
+    "Icon=%s\\n"
+    "Terminal=false\\n"
+    "Categories=System;Utility;Development;\\n"
+    "StartupNotify=true\\n",
+    self_path, icon_dest);
+  fclose(df);
+  chmod(desktop_file, 0644);
+  printf("Atalho criado no menu do sistema: %s\\n", desktop_file);
+  return 0;
+}
+
+int main(int argc, char *argv[]) {
+  char self_path[1024];
+  ssize_t n = readlink("/proc/self/exe", self_path, sizeof(self_path) - 1);
+  if (n <= 0) {
+    fprintf(stderr, "[Aegis AppImage] Nao foi possivel resolver /proc/self/exe\\n");
+    return 1;
+  }
+  self_path[n] = '\\0';
+
+  if (argc > 1 && (strcmp(argv[1], "--appimage-version") == 0)) {
+    printf("AegisDesktop AppImage v%s (Linux x86_64 ELF, zero-FUSE self-contained runtime)\\n", APPIMG_VERSION);
+    return 0;
+  }
+
+  if (argc > 1 && (strcmp(argv[1], "--appimage-help") == 0)) {
+    printf("AegisDesktop-%s-x86_64.AppImage (Portatil, sem FUSE, sem root)\\n", APPIMG_VERSION);
+    printf("  (sem argumentos)     Inicia o daemon local e abre a HUD Holografica 3D\\n");
+    printf("  --appimage-version   Exibe versao da AppImage\\n");
+    printf("  --appimage-extract   Extrai o AppDir interno em ./squashfs-root\\n");
+    printf("  --integrate          Cria atalho no menu de aplicativos (~/.local/share/applications)\\n");
+    printf("  --doctor             Executa diagnostico completo do sistema\\n");
+    printf("  --status | --start | --stop\\n");
+    return 0;
+  }
+
+  uint64_t offset = 0, size = 0;
+  if (read_trailer(self_path, &offset, &size) != 0) {
+    fprintf(stderr, "[Aegis AppImage] Arquivo AppImage corrompido (trailer nao encontrado).\\n");
+    return 1;
+  }
+
+  if (argc > 1 && strcmp(argv[1], "--appimage-extract") == 0) {
+    if (extract_payload_to(self_path, offset, size, "squashfs-root") != 0) {
+      return 1;
+    }
+    printf("squashfs-root\\n");
+    return 0;
+  }
+
+  char cache_dir[1024];
+  if (ensure_cache_extracted(self_path, offset, size, cache_dir, sizeof(cache_dir)) != 0) {
+    fprintf(stderr, "[Aegis AppImage] Falha ao preparar cache local em %s\\n", cache_dir);
+    return 1;
+  }
+
+  if (argc > 1 && strcmp(argv[1], "--integrate") == 0) {
+    return integrate_desktop(self_path, cache_dir);
+  }
+
+  char opt_dir[1200];
+  char apprun[1200];
+  snprintf(opt_dir, sizeof(opt_dir), "%s/opt/aegis", cache_dir);
+  snprintf(apprun, sizeof(apprun), "%s/AppRun", cache_dir);
+
+  setenv("APPDIR", cache_dir, 1);
+  setenv("APPIMAGE", self_path, 1);
+  setenv("AEGIS_HOME", opt_dir, 1);
+
+  char **child_argv = calloc((size_t)argc + 1, sizeof(char *));
+  if (!child_argv) return 1;
+  child_argv[0] = apprun;
+  for (int i = 1; i < argc; i++) {
+    child_argv[i] = argv[i];
+  }
+  child_argv[argc] = NULL;
+  execv(apprun, child_argv);
+  perror("execv(AppRun)");
+  free(child_argv);
+  return 127;
+}
+`;
+
+const APPIMAGE_APPRUN_SH = `#!/bin/sh
+set -e
+HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+export APPDIR="$HERE"
+export AEGIS_HOME="$HERE/opt/aegis"
+exec "$HERE/usr/bin/aegis-desktop" "$@"
+`;
+
 export function buildLinuxNativeArtifacts(): LinuxNativeCache {
   if (linuxCache) return linuxCache;
 
   const linuxDir = path.join(BUILD_ROOT, 'linux');
   const debRoot = path.join(linuxDir, 'deb-pkg');
+  const appDirRoot = path.join(linuxDir, 'appimage-stage', 'AegisDesktop.AppDir');
   const tarRoot = path.join(linuxDir, 'tar-pkg', `aegis-desktop-${APP_VERSION}`);
 
   fs.rmSync(linuxDir, { recursive: true, force: true });
@@ -963,7 +1262,7 @@ export function buildLinuxNativeArtifacts(): LinuxNativeCache {
   fs.chmodSync(elfOutPath, 0o755);
   const elfBuffer = fs.readFileSync(elfOutPath);
 
-  // Runtime files from linuxBundle.ts
+  // Runtime files from linuxBundle.ts (now powered by 3D Holographic HUD ui.html)
   const bundleFiles = getLinuxBundleFiles();
   const runtimeNames = new Set(['aegis-daemon.mjs', 'aegis-cli.mjs', 'ui.html', 'package.json']);
   const runtimeFiles = bundleFiles.filter((f) => runtimeNames.has(f.name));
@@ -1019,7 +1318,52 @@ export function buildLinuxNativeArtifacts(): LinuxNativeCache {
   });
   const debBuffer = fs.readFileSync(debOutPath);
 
-  // 3. Assemble Universal Linux .tar.gz (ELF binary + runtime + Electron project)
+  // 3. Compile Self-Contained x86_64 .AppImage (Zero-FUSE ELF + embedded AppDir .tar.gz + 32B trailer)
+  const appImgSrcPath = path.join(linuxDir, 'aegis-appimage-runtime.c');
+  const appImgRuntimePath = path.join(linuxDir, 'aegis-appimage-runtime');
+  fs.writeFileSync(appImgSrcPath, AEGIS_APPIMAGE_RUNTIME_C, 'utf8');
+  execFileSync('gcc', ['-O2', '-s', '-Wall', '-Wextra', '-o', appImgRuntimePath, appImgSrcPath], {
+    stdio: 'pipe',
+  });
+  const appImgRuntimeBuf = fs.readFileSync(appImgRuntimePath);
+
+  for (const d of ['usr/bin', 'opt/aegis']) {
+    fs.mkdirSync(path.join(appDirRoot, d), { recursive: true });
+  }
+  fs.writeFileSync(path.join(appDirRoot, 'AppRun'), APPIMAGE_APPRUN_SH, { mode: 0o755 });
+  fs.writeFileSync(
+    path.join(appDirRoot, 'aegis-desktop.desktop'),
+    LINUX_DESKTOP_ENTRY.replace('/usr/bin/aegis-desktop', 'AppRun'),
+    { mode: 0o644 }
+  );
+  fs.writeFileSync(path.join(appDirRoot, 'aegis-desktop.svg'), AEGIS_LINUX_SVG_ICON, { mode: 0o644 });
+  fs.copyFileSync(elfOutPath, path.join(appDirRoot, 'usr/bin/aegis-desktop'));
+  fs.chmodSync(path.join(appDirRoot, 'usr/bin/aegis-desktop'), 0o755);
+
+  for (const rf of runtimeFiles) {
+    fs.writeFileSync(path.join(appDirRoot, 'opt/aegis', rf.name), rf.content, {
+      mode: rf.name.endsWith('.mjs') ? 0o755 : 0o644,
+    });
+  }
+
+  const appDirPayloadPath = path.join(linuxDir, 'appdir-payload.tar.gz');
+  execFileSync(
+    'tar',
+    ['-czf', appDirPayloadPath, '-C', path.join(linuxDir, 'appimage-stage'), 'AegisDesktop.AppDir'],
+    { stdio: 'pipe' }
+  );
+  const appDirPayloadBuf = fs.readFileSync(appDirPayloadPath);
+
+  const trailerBuf = Buffer.alloc(32);
+  trailerBuf.write('AEGIS_APPIMG_V01', 0, 16, 'ascii');
+  trailerBuf.writeBigUInt64LE(BigInt(appImgRuntimeBuf.length), 16);
+  trailerBuf.writeBigUInt64LE(BigInt(appDirPayloadBuf.length), 24);
+
+  const appImageBuffer = Buffer.concat([appImgRuntimeBuf, appDirPayloadBuf, trailerBuf]);
+  const appImageOutPath = path.join(linuxDir, `AegisDesktop-${APP_VERSION}-x86_64.AppImage`);
+  fs.writeFileSync(appImageOutPath, appImageBuffer, { mode: 0o755 });
+
+  // 4. Assemble Universal Linux .tar.gz (ELF binary + runtime + Electron project)
   for (const d of ['bin', 'opt/aegis', 'share', 'electron-app/runtime']) {
     fs.mkdirSync(path.join(tarRoot, d), { recursive: true });
   }
@@ -1102,6 +1446,8 @@ jobs:
     elfSha256: sha256Hex(elfBuffer),
     debBuffer,
     debSha256: sha256Hex(debBuffer),
+    appImageBuffer,
+    appImageSha256: sha256Hex(appImageBuffer),
     tarGzBuffer,
     tarGzSha256: sha256Hex(tarGzBuffer),
     builtAt: new Date().toISOString(),
@@ -1613,6 +1959,18 @@ android.nonTransitiveRClass=true
   );
 
   root.file(
+    'gradle/wrapper/gradle-wrapper.properties',
+    `distributionBase=GRADLE_USER_HOME
+distributionPath=wrapper/dists
+distributionUrl=https\\://services.gradle.org/distributions/gradle-8.10.2-bin.zip
+networkTimeout=10000
+validateDistributionUrl=true
+zipStoreBase=GRADLE_USER_HOME
+zipStorePath=wrapper/dists
+`
+  );
+
+  root.file(
     'app/build.gradle.kts',
     `plugins {
     id("com.android.application")
@@ -1626,8 +1984,8 @@ android {
     defaultConfig {
         applicationId = "com.aegis.agent"
         minSdk = 26
-        targetSdk = 35
-        versionCode = 200
+        targetSdk = 34
+        versionCode = 210
         versionName = "${APP_VERSION}"
     }
 
@@ -1664,6 +2022,11 @@ dependencies {
   root.file('app/proguard-rules.pro', `# Keep Aegis runtime classes\n-keep class com.aegis.agent.** { *; }\n`);
 
   root.file(
+    'app/src/main/assets/aegis_hud.html',
+    getLocalHoloUiHtml({ platformMode: 'android', appVersion: APP_VERSION })
+  );
+
+  root.file(
     'app/src/main/AndroidManifest.xml',
     `<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
@@ -1673,6 +2036,9 @@ dependencies {
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
@@ -1681,6 +2047,8 @@ dependencies {
 
     <application
         android:allowBackup="true"
+        android:hardwareAccelerated="true"
+        android:enableOnBackInvokedCallback="true"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher"
@@ -1691,6 +2059,8 @@ dependencies {
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:hardwareAccelerated="true"
+            android:windowSoftInputMode="adjustResize"
             android:configChanges="orientation|screenSize|keyboardHidden">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -1745,6 +2115,7 @@ dependencies {
     `package com.aegis.agent
 
 import android.content.Context
+import android.net.Uri
 
 object AegisConfig {
     const val DEFAULT_SERVER_ORIGIN = "${safeOrigin}"
@@ -1753,13 +2124,33 @@ object AegisConfig {
 
     private const val PREFS = "aegis_native_prefs"
 
+    fun normalizeOrigin(raw: String?): String {
+        val trimmed = (raw ?: "").trim().trimEnd('/')
+        if (trimmed.isBlank()) return ""
+        val withScheme = if (trimmed.startsWith("http://", ignoreCase = true) ||
+            trimmed.startsWith("https://", ignoreCase = true)
+        ) {
+            trimmed
+        } else {
+            "https://" + trimmed
+        }
+        return try {
+            val parsed = Uri.parse(withScheme)
+            if (parsed.scheme.isNullOrBlank() || parsed.host.isNullOrBlank()) "" else withScheme
+        } catch (_: Exception) {
+            ""
+        }
+    }
+
     fun getServerOrigin(ctx: Context): String {
         val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        return prefs.getString("server_origin", DEFAULT_SERVER_ORIGIN) ?: DEFAULT_SERVER_ORIGIN
+        val saved = prefs.getString("server_origin", DEFAULT_SERVER_ORIGIN) ?: DEFAULT_SERVER_ORIGIN
+        val normalized = normalizeOrigin(saved)
+        return if (normalized.isNotBlank()) normalized else normalizeOrigin(DEFAULT_SERVER_ORIGIN)
     }
 
     fun setServerOrigin(ctx: Context, origin: String) {
-        val clean = origin.trim().trimEnd('/')
+        val clean = normalizeOrigin(origin)
         ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putString("server_origin", clean)
             .apply()
@@ -1767,12 +2158,15 @@ object AegisConfig {
 
     fun getWsUrl(ctx: Context): String {
         val origin = getServerOrigin(ctx)
-        val ws = if (origin.startsWith("https://")) {
-            "wss://" + origin.removePrefix("https://")
+        if (origin.isBlank()) return ""
+        val ws = if (origin.startsWith("https://", ignoreCase = true)) {
+            "wss://" + origin.substring(8)
+        } else if (origin.startsWith("http://", ignoreCase = true)) {
+            "ws://" + origin.substring(7)
         } else {
-            "ws://" + origin.removePrefix("http://")
+            return ""
         }
-        return "$ws/api/devices/ws?role=device"
+        return ws + "/api/devices/ws?role=device"
     }
 
     fun getDeviceToken(ctx: Context): String {
@@ -1803,225 +2197,332 @@ object AegisConfig {
     'app/src/main/java/com/aegis/agent/MainActivity.kt',
     `package com.aegis.agent
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.Settings
-import android.view.Gravity
-import android.view.View
+import android.view.ViewGroup
+import android.webkit.JavascriptInterface
+import android.webkit.PermissionRequest
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
+import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import android.widget.Button
-import android.widget.EditText
-import android.widget.LinearLayout
-import android.widget.ScrollView
-import android.widget.TextView
+import android.widget.FrameLayout
 import android.widget.Toast
+import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import org.json.JSONObject
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var webView: WebView
-    private lateinit var controlPanel: ScrollView
-    private lateinit var statusText: TextView
+    private val localHudUrl = "file:///android_asset/aegis_hud.html"
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#070B12"))
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.MATCH_PARENT
+        requestRuntimePermissions()
+
+        val root = FrameLayout(this).apply {
+            setBackgroundColor(Color.parseColor("#05070B"))
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
             )
         }
 
-        // Top Bar
-        val topBar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setBackgroundColor(Color.parseColor("#0C1220"))
-            setPadding(24, 24, 24, 20)
-            gravity = Gravity.CENTER_VERTICAL
-        }
-
-        val title = TextView(this).apply {
-            text = "AEGIS ANDROID NATIVO"
-            setTextColor(Color.parseColor("#FBBF24"))
-            textSize = 15f
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-        }
-
-        val btnControl = makeTabButton("Controle & Permissoes")
-        val btnHud = makeTabButton("HUD Aegis")
-
-        topBar.addView(title)
-        topBar.addView(btnControl)
-        topBar.addView(btnHud)
-        root.addView(topBar)
-
-        // Control Panel (Native Android System Setup)
-        controlPanel = ScrollView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                0,
-                1f
-            )
-        }
-
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(36, 32, 36, 48)
-        }
-
-        statusText = TextView(this).apply {
-            text = "Status do Servico: Pronto para conectar ao servidor Aegis"
-            setTextColor(Color.parseColor("#34D399"))
-            textSize = 13f
-            setPadding(0, 0, 0, 24)
-        }
-        content.addView(statusText)
-
-        val serverLabel = makeLabel("URL do Servidor Aegis (Nuvem ou Desktop)")
-        val serverInput = EditText(this).apply {
-            setText(AegisConfig.getServerOrigin(this@MainActivity))
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.GRAY)
-            setBackgroundColor(Color.parseColor("#111827"))
-            setPadding(24, 20, 24, 20)
-        }
-
-        val codeLabel = makeLabel("Codigo de Pareamento (6 digitos)")
-        val codeInput = EditText(this).apply {
-            setText(AegisConfig.getPairingCode(this@MainActivity))
-            hint = "Ex: A7K92P"
-            setTextColor(Color.parseColor("#FDE68A"))
-            setHintTextColor(Color.GRAY)
-            setBackgroundColor(Color.parseColor("#111827"))
-            setPadding(24, 20, 24, 20)
-        }
-
-        val btnStartService = makeActionButton("1. Conectar e Ativar Servico em Segundo Plano", "#F59E0B", "#090D16") {
-            AegisConfig.setServerOrigin(this, serverInput.text.toString())
-            AegisConfig.setPairingCode(this, codeInput.text.toString())
-            val intent = Intent(this, AegisForegroundService::class.java)
-            ContextCompat.startForegroundService(this, intent)
-            statusText.text = "Servico Nativo ATIVO — Conectando em " + AegisConfig.getServerOrigin(this)
-            Toast.makeText(this, "Aegis Foreground Service iniciado!", Toast.LENGTH_SHORT).show()
-        }
-
-        val btnAccessibility = makeActionButton("2. Ativar Acessibilidade (Toques, Apps e Tela)", "#1E293B", "#E2E8F0") {
-            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-        }
-
-        val btnNotif = makeActionButton("3. Ativar Leitura de Notificacoes", "#1E293B", "#E2E8F0") {
-            startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
-        }
-
-        val btnFiles = makeActionButton("4. Conceder Acesso a Todos os Arquivos (/sdcard)", "#1E293B", "#E2E8F0") {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
-                val i = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
-                    data = Uri.parse("package:$packageName")
-                }
-                startActivity(i)
-            } else {
-                Toast.makeText(this, "Permissao de arquivos ja ativa!", Toast.LENGTH_SHORT).show()
-            }
-        }
-
-        val btnBattery = makeActionButton("5. Ignorar Otimizacao de Bateria (Sempre Online)", "#1E293B", "#E2E8F0") {
-            val i = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                data = Uri.parse("package:$packageName")
-            }
-            startActivity(i)
-        }
-
-        content.addView(serverLabel)
-        content.addView(serverInput)
-        content.addView(codeLabel)
-        content.addView(codeInput)
-        content.addView(btnStartService)
-        content.addView(btnAccessibility)
-        content.addView(btnNotif)
-        content.addView(btnFiles)
-        content.addView(btnBattery)
-        controlPanel.addView(content)
-        root.addView(controlPanel)
-
-        // Integrated HUD WebView
         webView = WebView(this).apply {
-            visibility = View.GONE
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                0,
-                1f
+            setBackgroundColor(Color.parseColor("#05070B"))
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
             )
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
+            settings.databaseEnabled = true
+            settings.allowFileAccess = true
+            settings.allowContentAccess = true
+            settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
             settings.mediaPlaybackRequiresUserGesture = false
-            webViewClient = WebViewClient()
-            webChromeClient = WebChromeClient()
-        }
-        root.addView(webView)
+            settings.useWideViewPort = true
+            settings.loadWithOverviewMode = true
 
-        btnControl.setOnClickListener {
-            controlPanel.visibility = View.VISIBLE
-            webView.visibility = View.GONE
-        }
+            addJavascriptInterface(AegisAndroidBridge(), "AegisAndroid")
 
-        btnHud.setOnClickListener {
-            controlPanel.visibility = View.GONE
-            webView.visibility = View.VISIBLE
-            if (webView.url == null) {
-                webView.loadUrl(AegisConfig.getServerOrigin(this))
+            webChromeClient = object : WebChromeClient() {
+                override fun onPermissionRequest(request: PermissionRequest?) {
+                    runOnUiThread {
+                        try {
+                            request?.grant(request.resources)
+                        } catch (_: Exception) {
+                            request?.deny()
+                        }
+                    }
+                }
+            }
+
+            webViewClient = object : WebViewClient() {
+                override fun onReceivedError(
+                    view: WebView?,
+                    request: WebResourceRequest?,
+                    error: WebResourceError?
+                ) {
+                    super.onReceivedError(view, request, error)
+                    val isMainFrame = request?.isForMainFrame ?: true
+                    val failedUrl = request?.url?.toString() ?: ""
+                    if (isMainFrame && !failedUrl.startsWith("file:///android_asset/")) {
+                        runOnUiThread {
+                            Toast.makeText(
+                                this@MainActivity,
+                                "Servidor remoto inacessivel. Abrindo HUD Holografica embarcada...",
+                                Toast.LENGTH_LONG
+                            ).show()
+                            view?.loadUrl(localHudUrl)
+                        }
+                    }
+                }
             }
         }
 
+        root.addView(webView)
         setContentView(root)
 
-        if (AegisConfig.getDeviceToken(this).isNotBlank() || AegisConfig.getPairingCode(this).isNotBlank()) {
-            ContextCompat.startForegroundService(this, Intent(this, AegisForegroundService::class.java))
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                val current = webView.url ?: ""
+                if (webView.canGoBack()) {
+                    webView.goBack()
+                } else if (!current.startsWith("file:///android_asset/")) {
+                    webView.loadUrl(localHudUrl)
+                } else {
+                    isEnabled = false
+                    onBackPressedDispatcher.onBackPressed()
+                }
+            }
+        })
+
+        // Carrega imediatamente a HUD Holografica 3D embarcada (zero tela branca, zero erro de rede)
+        webView.loadUrl(localHudUrl)
+
+        // Apenas auto-inicia o ForegroundService se ja houver token pareado + servidor valido
+        if (AegisConfig.getDeviceToken(this).isNotBlank() && AegisConfig.getWsUrl(this).isNotBlank()) {
+            startAegisServiceSafely()
         }
     }
 
-    private fun makeLabel(label: String): TextView = TextView(this).apply {
-        text = label
-        setTextColor(Color.parseColor("#94A3B8"))
-        textSize = 12f
-        setPadding(0, 22, 0, 8)
-    }
-
-    private fun makeTabButton(label: String): Button = Button(this).apply {
-        text = label
-        textSize = 11f
-        isAllCaps = false
-        setTextColor(Color.parseColor("#E2E8F0"))
-        setBackgroundColor(Color.parseColor("#182234"))
-        setPadding(20, 10, 20, 10)
-    }
-
-    private fun makeActionButton(label: String, bgHex: String, fgHex: String, onClick: () -> Unit): Button =
-        Button(this).apply {
-            text = label
-            isAllCaps = false
-            setTextColor(Color.parseColor(fgHex))
-            setBackgroundColor(Color.parseColor(bgHex))
-            val lp = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            )
-            lp.topMargin = 22
-            layoutParams = lp
-            setPadding(28, 28, 28, 28)
-            setOnClickListener { onClick() }
+    private fun requestRuntimePermissions() {
+        val perms = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED
+            ) {
+                perms.add(Manifest.permission.POST_NOTIFICATIONS)
+            }
         }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            perms.add(Manifest.permission.RECORD_AUDIO)
+        }
+        if (perms.isNotEmpty()) {
+            try {
+                ActivityCompat.requestPermissions(this, perms.toTypedArray(), 201)
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun startAegisServiceSafely(): Boolean {
+        return try {
+            val intent = Intent(this, AegisForegroundService::class.java)
+            ContextCompat.startForegroundService(this, intent)
+            true
+        } catch (e: Exception) {
+            AegisForegroundService.lastError = e.message ?: "Falha ao iniciar servico"
+            runOnUiThread {
+                Toast.makeText(
+                    this,
+                    "Ative notificacoes ou bateria para rodar o servico em 2o plano.",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+            false
+        }
+    }
+
+    inner class AegisAndroidBridge {
+
+        @JavascriptInterface
+        fun getStatusJson(): String {
+            return try {
+                val filesGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    Environment.isExternalStorageManager()
+                } else {
+                    true
+                }
+                val battIntent = registerReceiver(null, android.content.IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                val level = battIntent?.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1) ?: -1
+                val scale = battIntent?.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, 100) ?: 100
+                val batteryPct = if (level >= 0 && scale > 0) (level * 100) / scale else -1
+
+                JSONObject().apply {
+                    put("serviceRunning", AegisForegroundService.isRunning)
+                    put("connectionState", AegisForegroundService.connectionState)
+                    put("lastError", AegisForegroundService.lastError)
+                    put("serverOrigin", AegisConfig.getServerOrigin(this@MainActivity))
+                    put("pairingCode", AegisConfig.getPairingCode(this@MainActivity))
+                    put("paired", AegisConfig.getDeviceToken(this@MainActivity).isNotBlank())
+                    put("accessibilityEnabled", AegisAccessibilityService.instance != null)
+                    put("notificationEnabled", AegisNotificationListener.isActive)
+                    put("notificationListenerEnabled", AegisNotificationListener.isActive)
+                    put("storageGranted", filesGranted)
+                    put("filesGranted", filesGranted)
+                    put("batteryPercent", batteryPct)
+                    put("manufacturer", Build.MANUFACTURER)
+                    put("model", Build.MODEL)
+                    put("androidVersion", Build.VERSION.RELEASE)
+                    put("sdkInt", Build.VERSION.SDK_INT)
+                }.toString()
+            } catch (_: Exception) {
+                "{}"
+            }
+        }
+
+        @JavascriptInterface
+        fun connectAndStart(origin: String?, pairingCode: String?): String {
+            return try {
+                if (!origin.isNullOrBlank()) {
+                    AegisConfig.setServerOrigin(this@MainActivity, origin)
+                }
+                if (!pairingCode.isNullOrBlank()) {
+                    AegisConfig.setPairingCode(this@MainActivity, pairingCode)
+                }
+                val resolvedOrigin = AegisConfig.getServerOrigin(this@MainActivity)
+                if (resolvedOrigin.isBlank()) {
+                    return JSONObject().apply {
+                        put("ok", false)
+                        put("message", "Informe uma URL de servidor valida (ex: https://seu-aegis.run.app).")
+                    }.toString()
+                }
+                val ok = startAegisServiceSafely()
+                if (ok) {
+                    runOnUiThread {
+                        Toast.makeText(
+                            this@MainActivity,
+                            "Aegis conectado em segundo plano!",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                }
+                JSONObject().apply {
+                    put("ok", ok)
+                    put("message", if (ok) "Servico nativo ativo conectando em " + resolvedOrigin else (AegisForegroundService.lastError.ifBlank { "Verifique permissoes de notificacao/bateria." }))
+                }.toString()
+            } catch (e: Exception) {
+                JSONObject().apply {
+                    put("ok", false)
+                    put("message", e.message ?: "Falha ao iniciar servico Android.")
+                }.toString()
+            }
+        }
+
+        @JavascriptInterface
+        fun stopService(): Boolean {
+            return try {
+                stopService(Intent(this@MainActivity, AegisForegroundService::class.java))
+                true
+            } catch (_: Exception) {
+                false
+            }
+        }
+
+        @JavascriptInterface
+        fun openRemoteHud(origin: String?) {
+            runOnUiThread {
+                val target = AegisConfig.normalizeOrigin(
+                    if (!origin.isNullOrBlank()) origin else AegisConfig.getServerOrigin(this@MainActivity)
+                )
+                if (target.isBlank()) {
+                    Toast.makeText(this@MainActivity, "Informe uma URL de servidor valida.", Toast.LENGTH_SHORT).show()
+                } else {
+                    AegisConfig.setServerOrigin(this@MainActivity, target)
+                    webView.loadUrl(target)
+                }
+            }
+        }
+
+        @JavascriptInterface
+        fun openLocalHud() {
+            runOnUiThread {
+                webView.loadUrl(localHudUrl)
+            }
+        }
+
+        @JavascriptInterface
+        fun openAccessibilitySettings() {
+            runOnUiThread {
+                try {
+                    startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                } catch (_: Exception) {}
+            }
+        }
+
+        @JavascriptInterface
+        fun openNotificationSettings() {
+            runOnUiThread {
+                try {
+                    startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                } catch (_: Exception) {}
+            }
+        }
+
+        @JavascriptInterface
+        fun openFilesPermission() {
+            runOnUiThread {
+                try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
+                        val i = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+                            data = Uri.parse("package:" + packageName)
+                        }
+                        startActivity(i)
+                    } else {
+                        Toast.makeText(this@MainActivity, "Permissao de arquivos ja concedida!", Toast.LENGTH_SHORT).show()
+                    }
+                } catch (_: Exception) {
+                    try {
+                        startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+                    } catch (_: Exception) {}
+                }
+            }
+        }
+
+        @JavascriptInterface
+        fun openBatterySettings() {
+            runOnUiThread {
+                try {
+                    val i = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                        data = Uri.parse("package:" + packageName)
+                    }
+                    startActivity(i)
+                } catch (_: Exception) {
+                    try {
+                        startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                    } catch (_: Exception) {}
+                }
+            }
+        }
+    }
 }
 `
   );
@@ -2036,12 +2537,14 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.ServiceInfo
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Environment
 import android.os.IBinder
 import android.os.StatFs
 import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -2060,20 +2563,49 @@ import java.util.concurrent.TimeUnit
 
 class AegisForegroundService : Service() {
 
+    companion object {
+        @Volatile
+        var isRunning: Boolean = false
+        @Volatile
+        var connectionState: String = "idle"
+        @Volatile
+        var lastError: String = ""
+    }
+
     private val client = OkHttpClient.Builder()
         .pingInterval(25, TimeUnit.SECONDS)
+        .connectTimeout(12, TimeUnit.SECONDS)
         .build()
 
     private var webSocket: WebSocket? = null
     private val serviceJob = Job()
     private val scope = CoroutineScope(Dispatchers.IO + serviceJob)
+    private var telemetryLoopStarted = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForeground(101, buildNotification("Conectando ao Orquestrador Aegis..."))
-        connectSocket()
-        startTelemetryLoop()
+        isRunning = true
+        lastError = ""
+        try {
+            val notif = buildNotification("Conectando ao Orquestrador Aegis...")
+            val fgType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            } else {
+                0
+            }
+            ServiceCompat.startForeground(this, 101, notif, fgType)
+        } catch (e: Exception) {
+            lastError = e.message ?: "Erro ao ativar ForegroundService"
+        }
+
+        scope.launch {
+            connectSocket()
+        }
+        if (!telemetryLoopStarted) {
+            telemetryLoopStarted = true
+            startTelemetryLoop()
+        }
         return START_STICKY
     }
 
@@ -2095,31 +2627,56 @@ class AegisForegroundService : Service() {
             .build()
     }
 
+    private fun updateNotification(text: String) {
+        try {
+            val nm = getSystemService(NotificationManager::class.java)
+            nm?.notify(101, buildNotification(text))
+        } catch (_: Exception) {}
+    }
+
     private fun connectSocket() {
         val wsUrl = AegisConfig.getWsUrl(this)
-        val req = Request.Builder().url(wsUrl).build()
+        if (wsUrl.isBlank()) {
+            connectionState = "unconfigured"
+            lastError = "Configure a URL do servidor Aegis."
+            return
+        }
+        val req = try {
+            Request.Builder().url(wsUrl).build()
+        } catch (e: Exception) {
+            connectionState = "error"
+            lastError = "URL invalida: " + (e.message ?: wsUrl)
+            return
+        }
+
+        connectionState = "connecting"
         webSocket?.close(1000, "reconnect")
         webSocket = client.newWebSocket(req, object : WebSocketListener() {
             override fun onOpen(ws: WebSocket, response: Response) {
-                val hello = JSONObject().apply {
-                    put("type", "hello")
-                    put("name", "\${Build.MANUFACTURER} \${Build.MODEL}")
-                    put("platform", "android")
-                    put("transport", "android_app_ws")
-                    put("serialOrUid", "\${Build.BRAND}_\${Build.MODEL}")
-                    val token = AegisConfig.getDeviceToken(this@AegisForegroundService)
-                    if (token.isNotBlank()) put("token", token)
-                    else put("pairingCode", AegisConfig.getPairingCode(this@AegisForegroundService))
-                    put("capabilities", JSONArray(listOf(
-                        "android_native_app",
-                        "accessibility_gestures",
-                        "notification_listener",
-                        "file_system",
-                        "apps_launcher",
-                        "telemetry"
-                    )))
-                }
-                ws.send(hello.toString())
+                connectionState = "online"
+                lastError = ""
+                updateNotification("Conectado a " + AegisConfig.getServerOrigin(this@AegisForegroundService))
+                try {
+                    val hello = JSONObject().apply {
+                        put("type", "hello")
+                        put("name", Build.MANUFACTURER + " " + Build.MODEL)
+                        put("platform", "android")
+                        put("transport", "android_app_ws")
+                        put("serialOrUid", Build.BRAND + "_" + Build.MODEL)
+                        val token = AegisConfig.getDeviceToken(this@AegisForegroundService)
+                        if (token.isNotBlank()) put("token", token)
+                        else put("pairingCode", AegisConfig.getPairingCode(this@AegisForegroundService))
+                        put("capabilities", JSONArray(listOf(
+                            "android_native_app",
+                            "accessibility_gestures",
+                            "notification_listener",
+                            "file_system",
+                            "apps_launcher",
+                            "telemetry"
+                        )))
+                    }
+                    ws.send(hello.toString())
+                } catch (_: Exception) {}
             }
 
             override fun onMessage(ws: WebSocket, text: String) {
@@ -2139,9 +2696,11 @@ class AegisForegroundService : Service() {
             }
 
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
+                connectionState = "reconnecting"
+                lastError = t.message ?: "Falha na conexao WebSocket"
                 scope.launch {
-                    delay(6000)
-                    if (isActive) connectSocket()
+                    delay(8000)
+                    if (isActive && isRunning) connectSocket()
                 }
             }
         })
@@ -2151,80 +2710,95 @@ class AegisForegroundService : Service() {
         scope.launch {
             while (isActive) {
                 delay(20_000)
-                sendSnapshot()
+                if (connectionState == "online") {
+                    sendSnapshot()
+                }
             }
         }
     }
 
     private fun collectTelemetry(): JSONObject {
-        val battIntent = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-        val level = battIntent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
-        val scale = battIntent?.getIntExtra(BatteryManager.EXTRA_SCALE, 100) ?: 100
-        val status = battIntent?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
-        val charging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
-            status == BatteryManager.BATTERY_STATUS_FULL
+        return try {
+            val battIntent = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            val level = battIntent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+            val scale = battIntent?.getIntExtra(BatteryManager.EXTRA_SCALE, 100) ?: 100
+            val status = battIntent?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+            val charging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+                status == BatteryManager.BATTERY_STATUS_FULL
+            val pct = if (level >= 0 && scale > 0) (level * 100) / scale else -1
 
-        val pct = if (level >= 0 && scale > 0) (level * 100) / scale else -1
-
-        return JSONObject().apply {
-            put("manufacturer", Build.MANUFACTURER)
-            put("model", Build.MODEL)
-            put("androidVersion", Build.VERSION.RELEASE)
-            put("sdkInt", Build.VERSION.SDK_INT)
-            if (pct >= 0) put("batteryPercent", pct)
-            put("charging", charging)
-            put("accessibilityEnabled", AegisAccessibilityService.instance != null)
-            put("notificationListenerEnabled", AegisNotificationListener.isActive)
+            JSONObject().apply {
+                put("manufacturer", Build.MANUFACTURER)
+                put("model", Build.MODEL)
+                put("androidVersion", Build.VERSION.RELEASE)
+                put("sdkInt", Build.VERSION.SDK_INT)
+                if (pct >= 0) put("batteryPercent", pct)
+                put("charging", charging)
+                put("accessibilityEnabled", AegisAccessibilityService.instance != null)
+                put("notificationListenerEnabled", AegisNotificationListener.isActive)
+            }
+        } catch (_: Exception) {
+            JSONObject()
         }
     }
 
     private fun collectStorage(): JSONObject {
-        val stat = StatFs(Environment.getDataDirectory().path)
-        val totalMb = (stat.blockCountLong * stat.blockSizeLong) / (1024 * 1024)
-        val availMb = (stat.availableBlocksLong * stat.blockSizeLong) / (1024 * 1024)
-        return JSONObject().apply {
-            put("totalMb", totalMb)
-            put("availableMb", availMb)
+        return try {
+            val stat = StatFs(Environment.getDataDirectory().path)
+            val totalMb = (stat.blockCountLong * stat.blockSizeLong) / (1024 * 1024)
+            val availMb = (stat.availableBlocksLong * stat.blockSizeLong) / (1024 * 1024)
+            JSONObject().apply {
+                put("totalMb", totalMb)
+                put("availableMb", availMb)
+            }
+        } catch (_: Exception) {
+            JSONObject()
         }
     }
 
     private fun collectInstalledApps(): JSONArray {
         val arr = JSONArray()
-        val pm = packageManager
-        val pkgs = pm.getInstalledApplications(0).take(120)
-        for (app in pkgs) {
-            arr.put(JSONObject().apply {
-                put("package", app.packageName)
-                put("label", pm.getApplicationLabel(app).toString())
-            })
-        }
+        try {
+            val pm = packageManager
+            val pkgs = pm.getInstalledApplications(0).take(120)
+            for (app in pkgs) {
+                arr.put(JSONObject().apply {
+                    put("package", app.packageName)
+                    put("label", pm.getApplicationLabel(app).toString())
+                })
+            }
+        } catch (_: Exception) {}
         return arr
     }
 
     private fun collectTopFiles(): JSONArray {
         val arr = JSONArray()
-        val dir = Environment.getExternalStorageDirectory()
-        dir.listFiles()?.take(60)?.forEach { f ->
-            arr.put(JSONObject().apply {
-                put("name", f.name)
-                put("path", f.absolutePath)
-                put("type", if (f.isDirectory) "directory" else "file")
-                put("size", f.length())
-            })
-        }
+        try {
+            val dir = Environment.getExternalStorageDirectory()
+            dir?.listFiles()?.take(60)?.forEach { f ->
+                arr.put(JSONObject().apply {
+                    put("name", f.name)
+                    put("path", f.absolutePath)
+                    put("type", if (f.isDirectory) "directory" else "file")
+                    put("size", f.length())
+                })
+            }
+        } catch (_: Exception) {}
         return arr
     }
 
     private fun sendSnapshot() {
-        val payload = JSONObject().apply {
-            put("type", "snapshot")
-            put("telemetry", collectTelemetry())
-            put("storage", collectStorage())
-            put("apps", collectInstalledApps())
-            put("files", collectTopFiles())
-            put("notifications", AegisNotificationListener.getSnapshotJson())
-        }
-        webSocket?.send(payload.toString())
+        try {
+            val payload = JSONObject().apply {
+                put("type", "snapshot")
+                put("telemetry", collectTelemetry())
+                put("storage", collectStorage())
+                put("apps", collectInstalledApps())
+                put("files", collectTopFiles())
+                put("notifications", AegisNotificationListener.getSnapshotJson())
+            }
+            webSocket?.send(payload.toString())
+        } catch (_: Exception) {}
     }
 
     private fun handleRemoteCommand(msg: JSONObject) {
@@ -2262,7 +2836,7 @@ class AegisForegroundService : Service() {
                     val f = File(fp)
                     if (!f.exists() || !f.isFile) {
                         ok = false
-                        output.put("error", "Arquivo nao encontrado: $fp")
+                        output.put("error", "Arquivo nao encontrado: " + fp)
                     } else {
                         output.put("path", f.absolutePath)
                         output.put("content", f.readText().take(20_000))
@@ -2280,7 +2854,7 @@ class AegisForegroundService : Service() {
                         output.put("launched", pkg)
                     } else {
                         ok = false
-                        output.put("error", "Pacote nao encontrado: $pkg")
+                        output.put("error", "Pacote nao encontrado: " + pkg)
                     }
                 }
                 "tap" -> {
@@ -2292,7 +2866,7 @@ class AegisForegroundService : Service() {
                         val x = payload.optDouble("x", 540.0).toFloat()
                         val y = payload.optDouble("y", 1200.0).toFloat()
                         acc.performTap(x, y)
-                        output.put("tapped", "$x,$y")
+                        output.put("tapped", x.toString() + "," + y.toString())
                     }
                 }
                 "swipe" -> {
@@ -2346,7 +2920,7 @@ class AegisForegroundService : Service() {
                 }
                 else -> {
                     ok = false
-                    output.put("error", "Comando nao suportado no app nativo: $cmdType")
+                    output.put("error", "Comando nao suportado no app nativo: " + cmdType)
                 }
             }
         } catch (e: Exception) {
@@ -2364,6 +2938,8 @@ class AegisForegroundService : Service() {
     }
 
     override fun onDestroy() {
+        isRunning = false
+        connectionState = "stopped"
         serviceJob.cancel()
         webSocket?.close(1000, "destroyed")
         super.onDestroy()
@@ -2526,12 +3102,16 @@ import androidx.core.content.ContextCompat
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action == Intent.ACTION_BOOT_COMPLETED) {
-            if (AegisConfig.getDeviceToken(context).isNotBlank()) {
-                ContextCompat.startForegroundService(
-                    context,
-                    Intent(context, AegisForegroundService::class.java)
-                )
-            }
+            try {
+                if (AegisConfig.getDeviceToken(context).isNotBlank() &&
+                    AegisConfig.getWsUrl(context).isNotBlank()
+                ) {
+                    ContextCompat.startForegroundService(
+                        context,
+                        Intent(context, AegisForegroundService::class.java)
+                    )
+                }
+            } catch (_: Exception) {}
         }
     }
 }
@@ -2552,8 +3132,9 @@ class BootReceiver : BroadcastReceiver() {
     'app/src/main/res/values/themes.xml',
     `<resources>
     <style name="Theme.AegisNative" parent="Theme.MaterialComponents.DayNight.NoActionBar">
-        <item name="android:statusBarColor">#070B12</item>
-        <item name="android:navigationBarColor">#070B12</item>
+        <item name="android:windowBackground">#05070B</item>
+        <item name="android:statusBarColor">#05070B</item>
+        <item name="android:navigationBarColor">#05070B</item>
     </style>
 </resources>
 `
@@ -2975,7 +3556,7 @@ export async function getNativeInstallersCatalog(
       os: 'linux',
       filename: `aegis-desktop_${APP_VERSION}_amd64.deb`,
       title: 'Aegis Desktop para Ubuntu / Debian / Pop!_OS (.deb)',
-      subtitle: 'Pacote instalavel real construido com dpkg-deb + binario ELF x86_64 compilado em C',
+      subtitle: 'Pacote instalável real com HUD Holográfica 3D embarcada + binário ELF x86_64 compilado em C',
       format: '.deb (x86_64 ELF)',
       architecture: 'amd64 / x86_64',
       downloadUrl: `/api/installers/linux/aegis-desktop_${APP_VERSION}_amd64.deb`,
@@ -2989,9 +3570,33 @@ export async function getNativeInstallersCatalog(
         'Opcional (segundo plano): systemctl --user enable --now aegis-desktop',
       ],
       capabilities: [
-        'Binario nativo ELF /usr/bin/aegis-desktop',
-        'Entrada oficial no Menu de Aplicativos (.desktop + icone SVG)',
-        'Servico de usuario systemd (--user) + ponte ADB Android',
+        'HUD Holográfica 3D completa (núcleo neural 60fps, comandos de voz, terminal e cofre AES-256)',
+        'Binário nativo ELF /usr/bin/aegis-desktop + entrada oficial no Menu de Aplicativos',
+        'Serviço de usuário systemd (--user) + ponte ADB Android',
+      ],
+    },
+    {
+      id: 'linux-appimage',
+      os: 'linux',
+      filename: `AegisDesktop-${APP_VERSION}-x86_64.AppImage`,
+      title: 'Aegis Desktop Linux Portátil (.AppImage — Zero FUSE / Zero Root)',
+      subtitle: 'Executável único autocontido (ELF x86_64 + HUD Holográfica 3D) compatível com todas as distros Linux',
+      format: '.AppImage (x86_64 Portátil)',
+      architecture: 'x86_64',
+      downloadUrl: `/api/installers/linux/AegisDesktop-${APP_VERSION}-x86_64.AppImage`,
+      sizeBytes: linux.appImageBuffer.length,
+      sha256: linux.appImageSha256,
+      compiledOnServer: true,
+      source: 'server_compiled',
+      installSteps: [
+        `chmod +x AegisDesktop-${APP_VERSION}-x86_64.AppImage`,
+        `./AegisDesktop-${APP_VERSION}-x86_64.AppImage  (ou clique duplo no gerenciador de arquivos)`,
+        `Opcional (criar ícone no menu): ./AegisDesktop-${APP_VERSION}-x86_64.AppImage --integrate`,
+      ],
+      capabilities: [
+        'Arquivo único portátil sem depender de libfuse2, apt ou sudo (funciona em Ubuntu 24.04, Fedora, Arch, Mint)',
+        'HUD Holográfica 3D embarcada + daemon local automático + suporte a --appimage-extract e --doctor',
+        'Integrável ao menu de aplicativos com --integrate',
       ],
     },
     ...ghLinux,
@@ -3000,7 +3605,7 @@ export async function getNativeInstallersCatalog(
       os: 'linux',
       filename: 'aegis-desktop-linux-x64.tar.gz',
       title: 'Aegis Desktop Linux Universal (.tar.gz + Binario ELF + Electron)',
-      subtitle: 'Para Arch, Fedora, openSUSE, Mint e compilacao opcional de AppImage / RPM',
+      subtitle: 'Para Arch, Fedora, openSUSE, Mint e compilação opcional de Electron / RPM',
       format: '.tar.gz (ELF + Electron)',
       architecture: 'x86_64',
       downloadUrl: '/api/installers/linux/aegis-desktop-linux-x64.tar.gz',
@@ -3014,7 +3619,7 @@ export async function getNativeInstallersCatalog(
         'Execute aegis-desktop ou abra pelo menu de aplicativos',
       ],
       capabilities: [
-        'Inclui binario ELF x86_64 pre-compilado',
+        'Inclui binário ELF x86_64 pré-compilado + HUD Holográfica 3D',
         'Inclui projeto Electron + electron-builder (.AppImage / .rpm / .deb)',
         'Funciona sem root (~/.local) ou globalmente (sudo)',
       ],
@@ -3047,7 +3652,7 @@ export async function getNativeInstallersCatalog(
       os: 'windows',
       filename: `AegisDesktop-Windows-Native-${APP_VERSION}.zip`,
       title: 'Aegis Desktop Nativo para Windows 10 / 11 (Kit Compilação Local -> AegisDesktop.exe)',
-      subtitle: 'Aplicativo C# WinForms com bandeja do sistema + compilacao nativa zero-SDK (csc.exe) + projeto NSIS/MSI',
+      subtitle: 'Aplicativo C# WinForms com bandeja do sistema + HUD Holográfica 3D + compilação zero-SDK (csc.exe)',
       format: 'AegisDesktop.exe (C# WinForms + NSIS)',
       architecture: 'x64 (Windows 10/11)',
       downloadUrl: `/api/installers/windows/AegisDesktop-Windows-Native-${APP_VERSION}.zip`,
@@ -3061,7 +3666,7 @@ export async function getNativeInstallersCatalog(
         'Ou rode o GitHub Actions (.github/workflows/release-all-apps.yml) e vincule o repositorio acima para baixar o .exe pronto',
       ],
       capabilities: [
-        'Gera AegisDesktop.exe real (PE32+ WinForms) + AegisUninstall.exe',
+        'Gera AegisDesktop.exe real (PE32+ WinForms) + HUD Holográfica 3D local',
         'Registra em Aplicativos Instalados do Windows, Menu Iniciar e Logon',
         'Inclui Electron + electron-builder (NSIS .exe / .msi) e Inno Setup (.iss)',
       ],
@@ -3071,10 +3676,10 @@ export async function getNativeInstallersCatalog(
       id: 'android-native',
       os: 'android',
       filename: `AegisAndroid-Native-${APP_VERSION}.zip`,
-      title: 'Aegis Android Nativo (Projeto Kotlin/Gradle -> .APK)',
-      subtitle: 'App Android real (com.aegis.agent) com ForegroundService, AccessibilityService e NotificationListener',
+      title: 'Aegis Android Nativo (Projeto Kotlin/Gradle -> .APK · Android 8–15 Corrigido)',
+      subtitle: 'App Android real (com.aegis.agent) com HUD Holográfica 3D embarcada, ForegroundService dataSync e ponte nativa',
       format: 'Android Studio / Gradle Kotlin (.apk)',
-      architecture: 'Android 8.0+ (API 26-35)',
+      architecture: 'Android 8.0–15 (API 26–35)',
       downloadUrl: `/api/installers/android/AegisAndroid-Native-${APP_VERSION}.zip`,
       sizeBytes: android.buffer.length,
       sha256: android.sha256,
@@ -3086,9 +3691,9 @@ export async function getNativeInstallersCatalog(
         'Compile no Android Studio (Build -> Build APK) ou rodando ./build-apk.sh',
       ],
       capabilities: [
-        'App nativo Android (nao e webapp): servico persistente + boot automatico',
-        'AccessibilityService real: toques, gestos, botoes de sistema e leitura de tela',
-        'NotificationListener + explorador completo /sdcard + HUD integrado',
+        'Abre direto na HUD Holográfica 3D embarcada (zero crash offline / Android 14–15 dataSync corrigido)',
+        'Ponte nativa @JavascriptInterface para AccessibilityService, Notificações, Arquivos (/sdcard) e Bateria',
+        'Fallback automático para HUD local caso o servidor remoto esteja inacessível + permissão de microfone',
       ],
     },
   ];

@@ -683,10 +683,10 @@ export const DevicesMeshView: React.FC<DevicesMeshViewProps> = ({
           {pairTab === 'desktop' && (
             <div className="rounded-2xl border border-white/10 bg-[#0B101C] p-5 space-y-4">
               <h3 className="font-display text-sm font-semibold text-amber-300">
-                Instalar Aplicativo Nativo Desktop (Linux .deb / ELF & Windows AegisDesktop.exe)
+                Instalar Aplicativo Nativo Desktop (Linux .deb / .AppImage & Windows AegisDesktop.exe)
               </h3>
               <p className="text-xs text-slate-300 leading-relaxed">
-                Instale o aplicativo nativo do sistema operacional no seu computador para controle completo do PC e espelhamento automático de dispositivos Android conectados via ADB:
+                Instale o aplicativo nativo do sistema operacional com HUD Holográfica 3D para controle completo do PC e espelhamento automático de dispositivos Android conectados via ADB:
               </p>
               <div className="flex flex-wrap gap-2.5">
                 <a
@@ -696,6 +696,14 @@ export const DevicesMeshView: React.FC<DevicesMeshViewProps> = ({
                 >
                   <Download className="h-4 w-4" />
                   <span>Linux v2.1 (.deb · ELF x86_64)</span>
+                </a>
+                <a
+                  href="/api/installers/linux/AegisDesktop-2.1.0-x86_64.AppImage"
+                  download="AegisDesktop-2.1.0-x86_64.AppImage"
+                  className="min-h-[40px] inline-flex items-center gap-2 rounded-xl border border-amber-400/45 bg-amber-500/15 px-4 text-xs font-semibold text-amber-200 hover:bg-amber-500/25"
+                >
+                  <Download className="h-4 w-4 text-amber-300" />
+                  <span>Linux Portátil (.AppImage)</span>
                 </a>
                 <a
                   href="/api/installers/linux/aegis-desktop-linux-x64.tar.gz"
