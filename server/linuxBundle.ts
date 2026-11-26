@@ -288,6 +288,7 @@ const MEMORY_FILE = path.join(DATA_DIR, 'memory.jsonl');
 const FACTS_FILE = path.join(DATA_DIR, 'facts.json');
 const USAGE_FILE = path.join(DATA_DIR, 'usage.jsonl');
 const AUTH_FILE = path.join(DATA_DIR, 'auth.json');
+const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 const VAULT_FILE = path.join(DATA_DIR, 'vault.enc.json');
 const CLOUD_FILE = path.join(DATA_DIR, 'cloud.enc.json');
 const GOOGLE_SYNC_CACHE_FILE = path.join(DATA_DIR, 'google_sync_cache.json');
@@ -302,6 +303,53 @@ fs.mkdirSync(GOOGLE_SYNC_DIR, { recursive: true });
 if (!fs.existsSync(FACTS_FILE)) fs.writeFileSync(FACTS_FILE, '[]', 'utf-8');
 if (!fs.existsSync(MEMORY_FILE)) fs.writeFileSync(MEMORY_FILE, '', 'utf-8');
 if (!fs.existsSync(USAGE_FILE)) fs.writeFileSync(USAGE_FILE, '', 'utf-8');
+
+function loadLocalSettings() {
+  try {
+    if (!fs.existsSync(SETTINGS_FILE)) return {};
+    return JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf-8')) || {};
+  } catch {
+    return {};
+  }
+}
+
+function saveLocalSettings(patch) {
+  const cur = loadLocalSettings();
+  const next = { ...cur, ...patch, updatedAt: new Date().toISOString() };
+  fs.writeFileSync(SETTINGS_FILE, JSON.stringify(next, null, 2), { mode: 0o600 });
+  return next;
+}
+
+function saveLocalApiKey(apiKey) {
+  const clean = String(apiKey || '').trim();
+  const envDir = IS_WIN ? path.join(HOME, 'AppData', 'Roaming', 'Aegis') : path.join(HOME, '.config', 'aegis');
+  fs.mkdirSync(envDir, { recursive: true });
+  const envPath = path.join(envDir, 'env');
+  let lines = [];
+  if (fs.existsSync(envPath)) {
+    lines = fs.readFileSync(envPath, 'utf-8').split(/\\r?\\n/).filter((l) => !/^\\s*(export\\s+)?GEMINI_API_KEY\\s*=/.test(l));
+  }
+  if (clean) {
+    lines.push('GEMINI_API_KEY=' + clean);
+    process.env.GEMINI_API_KEY = clean;
+  } else {
+    delete process.env.GEMINI_API_KEY;
+  }
+  fs.writeFileSync(envPath, lines.filter((l, i, arr) => l || i < arr.length - 1).join('\\n') + '\\n', { mode: 0o600 });
+}
+
+const backgroundJobs = new Map();
+const BACKGROUND_JOB_ORDER = [];
+function upsertBackgroundJob(job) {
+  backgroundJobs.set(job.id, job);
+  if (!BACKGROUND_JOB_ORDER.includes(job.id)) {
+    BACKGROUND_JOB_ORDER.unshift(job.id);
+    while (BACKGROUND_JOB_ORDER.length > 30) {
+      const oldId = BACKGROUND_JOB_ORDER.pop();
+      if (oldId) backgroundJobs.delete(oldId);
+    }
+  }
+}
 
 function getVaultKey() {
   if (fs.existsSync(KEY_FILE)) {
@@ -368,7 +416,12 @@ function loadAuthUser() {
 function isAuthed(req) {
   const authUser = loadAuthUser();
   if (!authUser) return false;
-  const tok = req.headers['x-aegis-local-token'];
+  let tok = req.headers['x-aegis-local-token'];
+  if (!tok && req.url && req.url.includes('token=')) {
+    try {
+      tok = new URL(req.url, 'http://127.0.0.1').searchParams.get('token');
+    } catch {}
+  }
   if (!tok) return false;
   if (tok === CLI_TOKEN) return true;
   const exp = activeSessions.get(tok);
@@ -390,46 +443,88 @@ function normalizeGeminiContents(contents) {
 }
 
 function getAiClient() {
+  const FALLBACK_ALIAS_MAP = {
+    'gemini-4-carbon': 'gemini-2.5-pro',
+    'gemini-4-argon': 'gemini-2.5-pro',
+    'gemini-4-neon': 'gemini-2.5-flash',
+    'gemini-4-hydrogen': 'gemini-2.5-flash',
+    'gemini-3.1-flash-lite': 'gemini-2.5-flash-lite',
+  };
+
+  async function callRest(modelName, contents, config, useThinking) {
+    loadLocalEnvFiles();
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      throw new Error('GEMINI_API_KEY não definida. Configure na aba Configurações do Aegis ou em ~/.config/aegis/env.');
+    }
+    const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(modelName) + ':generateContent?key=' + encodeURIComponent(apiKey);
+    const body = { contents: normalizeGeminiContents(contents) };
+    if (config.systemInstruction) {
+      body.systemInstruction = { parts: [{ text: String(config.systemInstruction) }] };
+    }
+    if (Array.isArray(config.tools) && config.tools.length > 0) {
+      body.tools = config.tools;
+    }
+    if (useThinking && config.includeThoughts) {
+      body.generationConfig = {
+        ...(body.generationConfig || {}),
+        thinkingConfig: { includeThoughts: true },
+      };
+    }
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'User-Agent': 'aegis-desktop-native/2.1.0' },
+      body: JSON.stringify(body),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      const err = new Error(data.error?.message || ('Gemini API HTTP ' + r.status));
+      err.status = r.status;
+      throw err;
+    }
+    const parts = data.candidates?.[0]?.content?.parts || [];
+    const thoughts = parts.filter((p) => typeof p.text === 'string' && p.thought).map((p) => p.text).join('\\n').trim();
+    const text = parts.filter((p) => typeof p.text === 'string' && !p.thought).map((p) => p.text).join('');
+    const functionCalls = parts
+      .filter((p) => p.functionCall)
+      .map((p, idx) => ({
+        id: p.functionCall.id || ('fc_' + Date.now() + '_' + idx),
+        name: p.functionCall.name,
+        args: p.functionCall.args || {},
+      }));
+    return {
+      text,
+      thoughts,
+      resolvedModel: modelName,
+      functionCalls,
+      candidates: data.candidates || [],
+      usageMetadata: data.usageMetadata || null,
+    };
+  }
+
   return {
     models: {
       async generateContent({ model, contents, config = {} }) {
-        loadLocalEnvFiles();
-        const apiKey = process.env.GEMINI_API_KEY;
-        if (!apiKey) {
-          throw new Error('GEMINI_API_KEY não definida. Adicione em ~/.config/aegis/env e reinicie o Aegis Desktop.');
+        try {
+          return await callRest(model, contents, config, Boolean(config.includeThoughts));
+        } catch (err) {
+          if (config.includeThoughts && (err.status === 400 || /thinking/i.test(err.message || ''))) {
+            try {
+              return await callRest(model, contents, config, false);
+            } catch (innerErr) {
+              err = innerErr;
+            }
+          }
+          const aliasFallback = FALLBACK_ALIAS_MAP[model];
+          if (aliasFallback && (err.status === 404 || /not found|unsupported/i.test(err.message || ''))) {
+            try {
+              return await callRest(aliasFallback, contents, config, Boolean(config.includeThoughts));
+            } catch {
+              return await callRest(aliasFallback, contents, config, false);
+            }
+          }
+          throw err;
         }
-        const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent?key=' + encodeURIComponent(apiKey);
-        const body = { contents: normalizeGeminiContents(contents) };
-        if (config.systemInstruction) {
-          body.systemInstruction = { parts: [{ text: String(config.systemInstruction) }] };
-        }
-        if (Array.isArray(config.tools) && config.tools.length > 0) {
-          body.tools = config.tools;
-        }
-        const r = await fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'User-Agent': 'aegis-desktop-native/2.1.0' },
-          body: JSON.stringify(body),
-        });
-        const data = await r.json().catch(() => ({}));
-        if (!r.ok) {
-          throw new Error(data.error?.message || ('Gemini API HTTP ' + r.status));
-        }
-        const parts = data.candidates?.[0]?.content?.parts || [];
-        const text = parts.filter((p) => typeof p.text === 'string' && !p.thought).map((p) => p.text).join('');
-        const functionCalls = parts
-          .filter((p) => p.functionCall)
-          .map((p, idx) => ({
-            id: p.functionCall.id || ('fc_' + Date.now() + '_' + idx),
-            name: p.functionCall.name,
-            args: p.functionCall.args || {},
-          }));
-        return {
-          text,
-          functionCalls,
-          candidates: data.candidates || [],
-          usageMetadata: data.usageMetadata || null,
-        };
       },
     },
   };
@@ -948,9 +1043,69 @@ const server = http.createServer(async (req, res) => {
     return res.end('<!doctype html><html><body style="background:#070B12;color:#F8FAFC;font-family:sans-serif;padding:32px"><h2>Aegis Desktop Daemon v2.1.0 Online</h2><p>Porta 127.0.0.1:' + PORT + ' ativa. Arquivo ui.html não localizado em ' + SCRIPT_DIR + '.</p></body></html>');
   }
 
+  if (pathname === '/google/oauth/receive' && req.method === 'GET') {
+    const bridgeHtml = [
+      '<!doctype html><html lang="pt-BR"><head><meta charset="UTF-8" /><title>Aegis Google Sync</title>',
+      '<style>body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#05070B;color:#F1F5F9;font-family:system-ui,sans-serif;}',
+      '.box{max-width:440px;padding:28px;border-radius:18px;border:1px solid rgba(245,158,11,0.35);background:#0C111C;text-align:center;box-shadow:0 24px 60px rgba(0,0,0,0.8);}',
+      'h2{margin:0 0 8px;color:#FBBF24;font-size:18px;}p{margin:0 0 14px;color:#94A3B8;font-size:13px;line-height:1.5;}',
+      '.ok{color:#34D399;font-weight:600;}.err{color:#FB7185;}</style></head><body>',
+      '<div class="box"><h2>Sincronizando Conta Google</h2><p id="st">Recebendo credencial OAuth no Aegis Local...</p></div>',
+      '<script>',
+      '(async function(){',
+      '  const hash = new URLSearchParams(location.hash.replace(/^#/, ""));',
+      '  const qs = new URLSearchParams(location.search);',
+      '  const token = hash.get("access_token") || qs.get("access_token") || "";',
+      '  let email = hash.get("email") || qs.get("email") || "";',
+      '  const st = document.getElementById("st");',
+      '  if (!token) { st.className = "err"; st.textContent = "Token Google não recebido. Feche esta aba e tente novamente."; return; }',
+      '  try {',
+      '    if (!email) {',
+      '      const uRes = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", { headers: { Authorization: "Bearer " + token } });',
+      '      if (uRes.ok) { const u = await uRes.json(); email = u.email || u.name || "Google User"; }',
+      '    }',
+      '    const localTok = localStorage.getItem("aegis_local_token") || "";',
+      '    const headers = { "Content-Type": "application/json" };',
+      '    if (localTok) headers["X-Aegis-Local-Token"] = localTok;',
+      '    const r = await fetch("/google/oauth/complete", { method: "POST", headers, body: JSON.stringify({ token, email: email || "Google User" }) });',
+      '    const d = await r.json();',
+      '    if (!r.ok) throw new Error(d.error || "Falha ao gravar token");',
+      '    st.className = "ok";',
+      '    st.textContent = "Google conectado (" + (d.email || email || "Conta Google") + ")! Retornando para a HUD 3D...";',
+      '    if (window.opener && !window.opener.closed) { try { window.opener.postMessage({ type: "aegis_google_connected", email: d.email || email }, "*"); } catch {} setTimeout(() => window.close(), 1100); }',
+      '    else { setTimeout(() => { location.href = "/"; }, 1100); }',
+      '  } catch (e) { st.className = "err"; st.textContent = "Erro: " + (e.message || e); }',
+      '})();',
+      '</script></body></html>',
+    ].join('');
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    return res.end(bridgeHtml);
+  }
+
+  if (pathname === '/google/oauth/complete' && req.method === 'POST') {
+    const body = await readBody(req);
+    const token = String(body.token || '').trim();
+    const email = String(body.email || 'Google User').trim();
+    if (!token) return sendJson(res, 400, { error: 'Token OAuth ausente.' });
+    const cloud = loadCloudConnections();
+    cloud.google = { token, email, updatedAt: new Date().toISOString() };
+    saveCloudConnections(cloud);
+    let snap = null;
+    try {
+      snap = await runFullGoogleWorkspaceSync(token, email);
+    } catch {}
+    return sendJson(res, 200, {
+      ok: true,
+      email,
+      synced: Boolean(snap),
+      counts: snap ? { drive: snap.drive.length, gmail: snap.gmail.length, calendar: snap.calendar.length, tasks: snap.tasks.length } : null,
+    });
+  }
+
   if (pathname === '/health') {
     const cloud = loadCloudConnections();
     const gCache = loadGoogleSyncCache();
+    const settings = loadLocalSettings();
     return sendJson(res, 200, {
       status: 'ok',
       version: '2.1.0',
@@ -963,6 +1118,8 @@ const server = http.createServer(async (req, res) => {
       googleConnected: Boolean(cloud.google?.token),
       googleEmail: cloud.google?.email || null,
       lastGoogleSyncAt: gCache.lastSyncAt || null,
+      modelPreference: settings.modelPreference || 'auto',
+      activeJobsCount: Array.from(backgroundJobs.values()).filter((j) => j.status === 'running').length,
     });
   }
 
@@ -1026,6 +1183,15 @@ const server = http.createServer(async (req, res) => {
       if (m) diskPct = Number(m[1]);
     } catch {}
     const cpus = os.cpus();
+    const totalMemMb = Math.round(os.totalmem() / 1048576);
+    const freeMemMb = Math.round(os.freemem() / 1048576);
+    const ramUsagePercent = totalMemMb > 0 ? Math.min(100, Math.max(0, Math.round(((totalMemMb - freeMemMb) / totalMemMb) * 100))) : 0;
+    const load1 = os.loadavg()[0] || 0;
+    const cpuUsagePercent = Math.min(100, Math.max(1, Math.round((load1 / Math.max(1, cpus.length)) * 100)));
+    const cloud = loadCloudConnections();
+    const gCache = loadGoogleSyncCache();
+    const settings = loadLocalSettings();
+    const activeJobsCount = Array.from(backgroundJobs.values()).filter((j) => j.status === 'running').length;
     return sendJson(res, 200, {
       hostname: os.hostname(),
       platform: os.platform(),
@@ -1034,35 +1200,112 @@ const server = http.createServer(async (req, res) => {
       uptimeSeconds: Math.floor(os.uptime()),
       cpuCount: cpus.length,
       cpuModel: cpus[0]?.model || 'Linux CPU',
-      totalMemMb: Math.round(os.totalmem() / 1048576),
-      freeMemMb: Math.round(os.freemem() / 1048576),
+      cpuUsagePercent,
+      totalMemMb,
+      freeMemMb,
+      ramUsagePercent,
       loadAvg: os.loadavg().map((n) => Number(n.toFixed(2))),
       homeDir: HOME,
       diskUsage,
       diskPct,
+      hasApiKey: Boolean(process.env.GEMINI_API_KEY),
+      googleConnected: Boolean(cloud.google?.token),
+      googleEmail: cloud.google?.email || gCache.email || null,
+      lastGoogleSyncAt: gCache.lastSyncAt || null,
+      googleCounts: {
+        drive: gCache.drive?.length || 0,
+        gmail: gCache.gmail?.length || 0,
+        calendar: gCache.calendar?.length || 0,
+        tasks: gCache.tasks?.length || 0,
+      },
+      modelPreference: settings.modelPreference || 'auto',
+      cloudOrigin: settings.cloudOrigin || process.env.AEGIS_CLOUD_URL || '',
+      googleClientId: settings.googleClientId || '',
+      activeJobsCount,
     });
+  }
+
+  if (pathname === '/settings' && req.method === 'GET') {
+    const s = loadLocalSettings();
+    return sendJson(res, 200, {
+      modelPreference: s.modelPreference || 'auto',
+      cloudOrigin: s.cloudOrigin || process.env.AEGIS_CLOUD_URL || '',
+      googleClientId: s.googleClientId || '',
+      hasApiKey: Boolean(process.env.GEMINI_API_KEY),
+    });
+  }
+
+  if (pathname === '/settings' && req.method === 'POST') {
+    const body = await readBody(req);
+    const patch = {};
+    if (typeof body.modelPreference === 'string') patch.modelPreference = body.modelPreference;
+    if (typeof body.cloudOrigin === 'string') patch.cloudOrigin = body.cloudOrigin.trim().replace(/\\/+$/, '');
+    if (typeof body.googleClientId === 'string') patch.googleClientId = body.googleClientId.trim();
+    if (typeof body.geminiApiKey === 'string' && body.geminiApiKey.trim()) {
+      saveLocalApiKey(body.geminiApiKey.trim());
+    }
+    const saved = saveLocalSettings(patch);
+    return sendJson(res, 200, {
+      ok: true,
+      modelPreference: saved.modelPreference || 'auto',
+      cloudOrigin: saved.cloudOrigin || '',
+      googleClientId: saved.googleClientId || '',
+      hasApiKey: Boolean(process.env.GEMINI_API_KEY),
+    });
+  }
+
+  if (pathname === '/jobs' && req.method === 'GET') {
+    const list = BACKGROUND_JOB_ORDER.map((id) => backgroundJobs.get(id)).filter(Boolean);
+    return sendJson(res, 200, { jobs: list });
+  }
+
+  if (pathname.startsWith('/jobs/') && req.method === 'GET') {
+    const jid = decodeURIComponent(pathname.slice('/jobs/'.length));
+    const job = backgroundJobs.get(jid);
+    if (!job) return sendJson(res, 404, { error: 'Tarefa não encontrada.' });
+    return sendJson(res, 200, { job });
+  }
+
+  if (pathname.startsWith('/jobs/') && req.method === 'DELETE') {
+    const jid = decodeURIComponent(pathname.slice('/jobs/'.length));
+    backgroundJobs.delete(jid);
+    const idx = BACKGROUND_JOB_ORDER.indexOf(jid);
+    if (idx >= 0) BACKGROUND_JOB_ORDER.splice(idx, 1);
+    return sendJson(res, 200, { ok: true });
   }
 
   if (pathname === '/usage' && req.method === 'GET') {
     const logs = readJsonLines(USAGE_FILE, 200);
     const byModelMap = {};
-    let promptTokens = 0, outputTokens = 0, totalTokens = 0, latencySum = 0;
+    let promptTokens = 0, outputTokens = 0, thoughtsTokens = 0, totalTokens = 0, latencySum = 0;
+    let curationsSkipped = 0, escalationsCount = 0, fallbacksCount = 0;
     for (const l of logs) {
       promptTokens += l.promptTokens || 0;
       outputTokens += l.outputTokens || 0;
+      thoughtsTokens += l.thoughtsTokens || 0;
       totalTokens += l.totalTokens || 0;
       latencySum += l.latencyMs || 0;
-      if (!byModelMap[l.model]) byModelMap[l.model] = { model: l.model, requests: 0, totalTokens: 0 };
+      if (l.curationSkipped) curationsSkipped += 1;
+      if (l.escalated) escalationsCount += 1;
+      if (l.fallbackUsed) fallbacksCount += 1;
+      if (!byModelMap[l.model]) byModelMap[l.model] = { model: l.model, requests: 0, totalTokens: 0, thoughtsTokens: 0 };
       byModelMap[l.model].requests += 1;
       byModelMap[l.model].totalTokens += l.totalTokens || 0;
+      byModelMap[l.model].thoughtsTokens += l.thoughtsTokens || 0;
     }
+    const settings = loadLocalSettings();
     return sendJson(res, 200, {
+      modelPreference: settings.modelPreference || 'auto',
       totals: {
         requests: logs.length,
         promptTokens,
         outputTokens,
+        thoughtsTokens,
         totalTokens,
         avgLatencyMs: logs.length ? Math.round(latencySum / logs.length) : 0,
+        curationsSkipped,
+        escalationsCount,
+        fallbacksCount,
       },
       byModel: Object.values(byModelMap),
       recent: logs.slice(-25).reverse(),
@@ -1508,13 +1751,611 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 200, { facts: next });
   }
 
-  if (pathname === '/command' && req.method === 'POST') {
+  function shouldRunLocalInBackground(promptStr, forceBg) {
+    if (forceBg) return { shouldRunInBackground: true, reason: 'Execução em segundo plano ativada manualmente.' };
+    const lower = String(promptStr || '').toLowerCase();
+    if (/\\b(em segundo plano|segundo plano|background|ass[ií]ncrono|sem travar)\\b/i.test(lower)) {
+      return { shouldRunInBackground: true, reason: 'Execução em segundo plano solicitada diretamente.' };
+    }
+    const heavySignals = [
+      'varredura', 'auditoria completa', 'analise todos os', 'extraia todos', 'baixe todos',
+      'organize todos', 'compare detalhadamente', 'relatório completo', 'pesquisa profunda',
+      'múltiplas pastas', 'multiplas pastas', 'sub-menus', 'submenus', 'todos os anexos',
+    ];
+    if (heavySignals.some((k) => lower.includes(k)) || lower.length > 260) {
+      return { shouldRunInBackground: true, reason: 'Demanda longa/multi-etapas movida para 2º plano para não travar o chat.' };
+    }
+    return { shouldRunInBackground: false, reason: 'Execução rápida em primeiro plano.' };
+  }
+
+  function buildLocalSubtasks(promptStr, route) {
+    const lower = String(promptStr || '').toLowerCase();
+    const tasks = [];
+    if (/(site|url|http|naveg|portal|login|extrai|anexo)/i.test(lower)) {
+      tasks.push({ id: 'st_web', label: 'Operador Web', objective: 'Mapear página, links, menus e extrair dados solicitados', model: 'gemini-3.1-flash-lite' });
+    }
+    if (/(drive|gmail|email|e-mail|agenda|calend|google|nuvem|tarefa|tasks)/i.test(lower)) {
+      tasks.push({ id: 'st_google', label: 'Coletor Google Workspace', objective: 'Consultar Drive, Gmail, Agenda e Tarefas sincronizados', model: 'gemini-3.1-flash-lite' });
+    }
+    if (/(arquivo|pasta|disco|cpu|ram|terminal|comando|processo|servi|downloads|home|bash|linux|windows)/i.test(lower)) {
+      tasks.push({ id: 'st_sys', label: 'Inspetor de Sistema Local', objective: 'Executar leitura/busca local e coletar métricas da máquina', model: 'gemini-3.1-flash-lite' });
+    }
+    if (tasks.length === 0) {
+      tasks.push({ id: 'st_collect', label: 'Trabalhador de Coleta', objective: 'Levantar contexto, fatos e estrutura inicial da resposta', model: 'gemini-3.1-flash-lite' });
+      if (route.tier !== 'lite' || lower.length > 75) {
+        tasks.push({ id: 'st_verify', label: 'Verificador Técnico', objective: 'Validar detalhes, passos e consistência antes da curadoria', model: 'gemini-3.1-flash-lite' });
+      }
+    }
+    return tasks.slice(0, 3);
+  }
+
+  async function runLocalOrchestration(params, emit) {
     const t0 = Date.now();
-    const { prompt, confirmedCommand, confirmedWebLogin, confirmedGoogleUpload, modelPreference = 'auto', googleEmail } = await readBody(req);
+    const settings = loadLocalSettings();
+    const prompt = String(params.prompt || '').trim();
+    const modelPreference = params.modelPreference || settings.modelPreference || 'auto';
+    const effectivePref = modelPreference === 'eco' ? 'gemini-3.1-flash-lite' : modelPreference;
+
+    appendJsonLine(MEMORY_FILE, { role: 'user', content: prompt });
+    const route = selectModel(prompt, effectivePref);
+    const curatorModel =
+      effectivePref === 'auto'
+        ? route.model === 'gemini-3.1-flash-lite' && prompt.length > 28
+          ? 'gemini-4-hydrogen'
+          : route.model
+        : effectivePref;
+
+    let activeModel = curatorModel;
+    let fallbackUsed = false;
+    let escalated = false;
+    let curationSkipped = false;
+    const facts = loadFacts().slice(0, 8).map((f) => f.content.slice(0, 140)).join('\\n- ');
+    const cloud = loadCloudConnections();
+    const gCache = loadGoogleSyncCache();
+
+    const thinkingTrace = [];
+    const pushTrace = (entry) => {
+      const full = {
+        id: entry.id || ('lt_' + Date.now() + '_' + thinkingTrace.length),
+        status: entry.status || 'done',
+        timestamp: new Date().toISOString(),
+        ...entry,
+      };
+      const existingIdx = thinkingTrace.findIndex((t) => t.id === full.id);
+      if (existingIdx >= 0) thinkingTrace[existingIdx] = { ...thinkingTrace[existingIdx], ...full };
+      else thinkingTrace.push(full);
+      if (emit) emit('trace', { entry: full, trace: thinkingTrace });
+      return full;
+    };
+
+    const emitRouting = (patch) => {
+      if (emit) emit('routing', patch);
+    };
+
+    const pendingConfirmations = [];
+    const outputs = [];
+    const screens = [];
+    const steps = [];
+    let promptTokens = 0, outputTokens = 0, thoughtsTokens = 0, totalTokens = 0;
+
+    const googleContextSummary = cloud.google?.token
+      ? 'Conectado (' + cloud.google.email + ') · Última sync: ' + (gCache.lastSyncAt || 'agora') + ' · Cache: ' + (gCache.drive?.length || 0) + ' arq Drive, ' + (gCache.gmail?.length || 0) + ' e-mails, ' + (gCache.calendar?.length || 0) + ' eventos, ' + (gCache.tasks?.length || 0) + ' tarefas.'
+      : 'Desconectado (o usuário pode conectar a conta Google direto no menu Google Sync do app local)';
+
+    const addUsageMeta = (um) => {
+      if (!um) return;
+      promptTokens += um.promptTokenCount || 0;
+      outputTokens += um.candidatesTokenCount || 0;
+      thoughtsTokens += um.thoughtsTokenCount || 0;
+      totalTokens += um.totalTokenCount || ((um.promptTokenCount || 0) + (um.candidatesTokenCount || 0));
+    };
+
+    const executeLocalTool = async (call, runningModel) => {
+      const toolTraceId = 'tool_' + Date.now() + '_' + steps.length;
+      pushTrace({ id: toolTraceId, kind: 'tool', status: 'running', title: call.name, detail: JSON.stringify(call.args || {}).slice(0, 160), model: runningModel, role: 'worker' });
+      emitRouting({ phase: 'invoking', activeModel: runningModel, activeTool: call.name, reason: 'Executando ferramenta local: ' + call.name });
+      let toolResult = {};
+      let status = 'executed';
+      try {
+        if (call.name === 'memory_remember' && call.args?.fact) {
+          saveFact(String(call.args.fact));
+          toolResult = { ok: true, saved: call.args.fact };
+          outputs.push({ tool: 'memory_remember', saved: call.args.fact });
+        } else if (call.name === 'draw_holographic_screen') {
+          const scr = {
+            id: 'scr_' + Date.now() + '_' + screens.length,
+            kind: String(call.args?.kind || 'interactive_dashboard'),
+            title: String(call.args?.title || 'Projeção Aegis Local'),
+            content: call.args?.content ? String(call.args.content) : '',
+            htmlCode: call.args?.htmlCode ? String(call.args.htmlCode) : '',
+            createdAt: new Date().toISOString(),
+          };
+          screens.push(scr);
+          toolResult = { ok: true, screenId: scr.id, message: 'Tela holográfica projetada.' };
+          outputs.push({ tool: 'draw_holographic_screen', title: scr.title, kind: scr.kind });
+        } else if (call.name === 'local_write_file') {
+          const targetFile = path.resolve(HOME, String(call.args?.path || ''));
+          fs.mkdirSync(path.dirname(targetFile), { recursive: true });
+          fs.writeFileSync(targetFile, String(call.args?.content || ''), 'utf-8');
+          toolResult = { ok: true, path: targetFile };
+          outputs.push({ tool: 'local_write_file', path: targetFile });
+        } else if (call.name === 'local_open_app') {
+          const tgt = String(call.args?.target || '').trim();
+          if (IS_WIN) await execNative('Start-Process ' + JSON.stringify(tgt));
+          else await execNative('nohup xdg-open ' + JSON.stringify(tgt) + ' >/dev/null 2>&1 &');
+          toolResult = { ok: true, opened: tgt };
+          outputs.push({ tool: 'local_open_app', target: tgt });
+        } else if (call.name === 'local_search') {
+          const dir = String(call.args?.directory || HOME).replace(/^~/, HOME);
+          const pat = String(call.args?.pattern || '');
+          const searchCmd = IS_WIN
+            ? 'Get-ChildItem -Path ' + JSON.stringify(dir) + ' -Recurse -Depth 3 -Filter "*' + pat + '*" -ErrorAction SilentlyContinue | Select-Object -First 30 -ExpandProperty FullName'
+            : 'find "' + dir + '" -maxdepth 3 -iname "*' + pat + '*" 2>/dev/null | head -n 30';
+          const { stdout } = await execNative(searchCmd);
+          toolResult = { ok: true, stdout };
+          outputs.push({ tool: 'local_search', stdout });
+        } else if (call.name === 'local_exec') {
+          const cmd = String(call.args?.command || '');
+          const cwd = call.args?.cwd ? String(call.args.cwd).replace(/^~/, HOME) : HOME;
+          if (isMutating(cmd)) {
+            status = 'awaiting_confirmation';
+            pendingConfirmations.push({ id: 'lconf_' + Date.now(), type: 'command', action_type: 'local_exec', target: cmd, summary: 'Executar comando destrutivo local: ' + cmd, command: cmd, reason: 'Ação destrutiva requer confirmação' });
+            toolResult = { status: 'AWAITING_USER_CONFIRMATION', command: cmd };
+          } else {
+            const { stdout, stderr } = await execNative(cmd, cwd);
+            toolResult = { ok: true, cmd, stdout: String(stdout || '').slice(0, 6000), stderr: String(stderr || '').slice(0, 2000), exitCode: 0 };
+            outputs.push({ tool: 'local_exec', cmd, stdout, stderr });
+          }
+        } else if (call.name === 'web_navigate') {
+          const snap = await webNavigate(String(call.args?.url || ''));
+          toolResult = { ok: snap.status < 400, url: snap.url, title: snap.title, status: snap.status, textPreview: snap.textPreview.slice(0, 3000), links: snap.links.slice(0, 10) };
+          outputs.push({ tool: 'web_navigate', url: snap.url, title: snap.title });
+        } else if (call.name === 'web_login') {
+          status = 'awaiting_confirmation';
+          pendingConfirmations.push({ id: 'lconf_' + Date.now(), type: 'web_login', action_type: 'web_login', target: String(call.args?.siteOrId || call.args?.loginUrl || 'site'), summary: 'Login web em ' + (call.args?.siteOrId || call.args?.loginUrl || 'site'), payload: call.args || {}, command: 'Login web em ' + (call.args?.siteOrId || call.args?.loginUrl || 'site') });
+          toolResult = { status: 'AWAITING_USER_CONFIRMATION' };
+        } else if (call.name === 'google_list_recent') {
+          const activeCloud = loadCloudConnections();
+          if (!activeCloud.google?.token) {
+            toolResult = { ok: false, error: 'Google não conectado no Aegis Local. Clique em "Conectar Google" na barra superior.' };
+          } else {
+            const svc = String(call.args?.service || 'all').toLowerCase();
+            if (svc === 'all') {
+              const snap = await runFullGoogleWorkspaceSync(activeCloud.google.token, activeCloud.google.email);
+              toolResult = { ok: true, syncedAt: snap.lastSyncAt, drive: snap.drive.slice(0, 12), gmail: snap.gmail.slice(0, 6), calendar: snap.calendar.slice(0, 8), tasks: snap.tasks.slice(0, 10) };
+            } else if (svc === 'drive') {
+              const fId = call.args?.folderId ? String(call.args.folderId) : 'root';
+              const r = await fetch("https://www.googleapis.com/drive/v3/files?pageSize=20&orderBy=folder,name&fields=files(id,name,mimeType,modifiedTime)&q=trashed%20%3D%20false%20and%20'" + encodeURIComponent(fId) + "'%20in%20parents", { headers: { Authorization: 'Bearer ' + activeCloud.google.token } });
+              toolResult = { ok: r.ok, data: await r.json() };
+            } else if (svc === 'calendar') {
+              const r = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events?maxResults=12&singleEvents=true&orderBy=startTime&timeMin=' + encodeURIComponent(new Date().toISOString()), { headers: { Authorization: 'Bearer ' + activeCloud.google.token } });
+              toolResult = { ok: r.ok, data: await r.json() };
+            } else if (svc === 'tasks') {
+              const r = await fetch('https://tasks.googleapis.com/tasks/v1/lists/@default/tasks?maxResults=15&showCompleted=false', { headers: { Authorization: 'Bearer ' + activeCloud.google.token } });
+              toolResult = { ok: r.ok, data: await r.json() };
+            } else {
+              const r = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=8', { headers: { Authorization: 'Bearer ' + activeCloud.google.token } });
+              toolResult = { ok: r.ok, data: await r.json() };
+            }
+          }
+          outputs.push({ tool: 'google_list_recent', ok: Boolean(toolResult.ok) });
+        } else if (call.name === 'google_drive_download_local') {
+          const activeCloud = loadCloudConnections();
+          if (!activeCloud.google?.token) {
+            toolResult = { ok: false, error: 'Google não conectado no Aegis Local.' };
+          } else {
+            const fId = String(call.args?.fileId || '');
+            const metaR = await fetch('https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(fId) + '?fields=id,name,mimeType', { headers: { Authorization: 'Bearer ' + activeCloud.google.token } });
+            const meta = await metaR.json();
+            let dlUrl = 'https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(fId) + '?alt=media';
+            let safeName = String(meta.name || fId).replace(/[\\\\/:*?"<>|]/g, '_');
+            if (meta.mimeType === 'application/vnd.google-apps.document') { dlUrl = 'https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(fId) + '/export?mimeType=text/plain'; safeName += '.txt'; }
+            else if (meta.mimeType === 'application/vnd.google-apps.spreadsheet') { dlUrl = 'https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(fId) + '/export?mimeType=text/csv'; safeName += '.csv'; }
+            const dlR = await fetch(dlUrl, { headers: { Authorization: 'Bearer ' + activeCloud.google.token } });
+            const buf = Buffer.from(await dlR.arrayBuffer());
+            const destDir = call.args?.targetDir ? path.resolve(HOME, String(call.args.targetDir).replace(/^~/, HOME)) : GOOGLE_SYNC_DIR;
+            fs.mkdirSync(destDir, { recursive: true });
+            const savedPath = path.join(destDir, safeName);
+            fs.writeFileSync(savedPath, buf);
+            toolResult = { ok: true, savedPath, bytes: buf.length };
+          }
+        } else if (call.name === 'google_drive_upload_local') {
+          status = 'awaiting_confirmation';
+          pendingConfirmations.push({ id: 'lconf_' + Date.now(), type: 'google_upload', action_type: 'google_drive_upload_local', target: String(call.args?.localPath || ''), summary: 'Enviar arquivo local "' + String(call.args?.localPath || '') + '" ao Google Drive', payload: call.args || {} });
+          toolResult = { status: 'AWAITING_USER_CONFIRMATION' };
+        }
+      } catch (toolErr) {
+        status = 'error';
+        toolResult = { ok: false, error: toolErr.message };
+      }
+      steps.push({ tool: call.name, args: call.args || {}, status, result: toolResult });
+      pushTrace({
+        id: toolTraceId,
+        kind: 'tool',
+        status: status === 'error' ? 'error' : 'done',
+        title: call.name,
+        detail: status === 'executed' ? 'Executado localmente com sucesso.' : (toolResult.error || 'Aguardando confirmação do operador'),
+        model: runningModel,
+        role: 'worker',
+      });
+      return { functionResponse: { id: call.id, name: call.name, response: toolResult } };
+    };
+
+    emitRouting({ phase: 'analyzing', activeModel: 'gemini-3.1-flash-lite', tier: route.tier, reason: 'Analisando complexidade e subdivisão de subagentes...' });
+    const isTrivial = /^(oi|olá|ola|bom dia|boa tarde|boa noite|ok|obrigado|valeu|ping|teste)[\\s!?.]*$/i.test(prompt);
+    const needsToolHint = /(arquivo|pasta|home|download|disco|cpu|ram|memória|memoria|processo|serviço|servico|comando|terminal|bash|exec|abrir|abre|site|url|http|login|logar|drive|gmail|email|e-mail|agenda|calendário|calendario|tarefa|tasks|android|adb|google|sincron|tela|desenhe)/i.test(prompt);
+
+    if ((isTrivial || (effectivePref === 'gemini-3.1-flash-lite' && !needsToolHint) || (route.tier === 'lite' && !needsToolHint && prompt.length <= 120)) && (effectivePref === 'auto' || effectivePref === 'gemini-3.1-flash-lite')) {
+      curationSkipped = true;
+      pushTrace({ kind: 'routing', status: 'done', title: 'Roteamento Econômico Direto', detail: 'Demanda conversacional simples atendida diretamente pelo Flash Lite (curadoria dispensada para economia máxima de tokens).', model: 'gemini-3.1-flash-lite', role: 'router' });
+      const directRes = await getAiClient().models.generateContent({
+        model: 'gemini-3.1-flash-lite',
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        config: {
+          systemInstruction: 'Você é o Aegis Local em ' + os.hostname() + '. Responda em Português de forma direta e concisa.',
+          includeThoughts: true,
+        },
+      });
+      addUsageMeta(directRes.usageMetadata);
+      if (directRes.thoughts) {
+        pushTrace({ kind: 'thought', status: 'done', title: 'Raciocínio Rápido', detail: directRes.thoughts, model: directRes.resolvedModel || 'gemini-3.1-flash-lite', role: 'worker' });
+      }
+      const replyText = (directRes.text || 'Pronto.').trim();
+      const latencyMs = Date.now() - t0;
+      const usageEntry = {
+        model: directRes.resolvedModel || 'gemini-3.1-flash-lite',
+        routingMode: effectivePref === 'auto' ? 'auto' : 'manual',
+        routingReason: 'Resposta direta econômica (curadoria dispensada)',
+        complexityTier: 'lite',
+        promptTokens,
+        outputTokens,
+        thoughtsTokens,
+        totalTokens,
+        latencyMs,
+        fallbackUsed: false,
+        escalated: false,
+        curationSkipped: true,
+        workerModels: ['gemini-3.1-flash-lite'],
+        curatorModel: 'gemini-3.1-flash-lite',
+        subtasksCount: 0,
+      };
+      appendJsonLine(USAGE_FILE, usageEntry);
+      appendJsonLine(MEMORY_FILE, { role: 'assistant', content: replyText, outputs, usage: usageEntry });
+      emitRouting({ phase: 'idle', activeModel: usageEntry.model, curatorModel: usageEntry.model, tier: 'lite', reason: usageEntry.routingReason });
+      return { reply: replyText, steps, outputs, screens, pendingConfirmations, usage: usageEntry, thinkingTrace };
+    }
+
+    // STAGE 1: Explicit Task Decomposition into Worker Sub-Agents ("Trabalho Bruto")
+    const subtasks = buildLocalSubtasks(prompt, route);
+    emitRouting({ phase: 'planning', activeModel: 'gemini-3.1-flash-lite', curatorModel, workerCount: subtasks.length, tier: route.tier, reason: 'Subdividindo em ' + subtasks.length + ' subagente(s) leves (trabalho bruto)' });
+    pushTrace({
+      kind: 'plan',
+      status: 'done',
+      title: 'Plano Multi-Agente (' + subtasks.length + ' ' + (subtasks.length === 1 ? 'trabalhador' : 'trabalhadores') + ' → Curadoria)',
+      detail: 'Modelos leves (Flash Lite) executam coleta, ferramentas e rascunho; Curador Sênior revisa apenas quando necessário.',
+      model: 'gemini-3.1-flash-lite',
+      role: 'decomposer',
+      subtasks,
+    });
+
+    const workerDossiers = [];
+    for (let sIdx = 0; sIdx < subtasks.length; sIdx++) {
+      const st = subtasks[sIdx];
+      const wStart = Date.now();
+      const wTraceId = 'worker_' + st.id + '_' + Date.now();
+      emitRouting({ phase: 'subagent', activeModel: st.model, curatorModel, activeSubagent: st.label, workerCount: subtasks.length, tier: route.tier, reason: 'Trabalhador #' + (sIdx + 1) + ': ' + st.objective });
+      pushTrace({ id: wTraceId, kind: 'worker', status: 'running', title: '#' + (sIdx + 1) + ' · ' + st.label, detail: st.objective, model: st.model, role: 'worker' });
+
+      const workerContents = [{
+        role: 'user',
+        parts: [{
+          text: 'Subtarefa #' + (sIdx + 1) + ' (' + st.label + '): ' + st.objective + '\\n\\nPedido completo do operador:\\n' + prompt + (workerDossiers.length ? '\\n\\nDescobertas anteriores:\\n' + workerDossiers.join('\\n---\\n').slice(0, 1400) : ''),
+        }],
+      }];
+
+      let wOut = '';
+      let wErr = false;
+      try {
+        for (let wHop = 0; wHop < 2; wHop++) {
+          const wRes = await getAiClient().models.generateContent({
+            model: st.model,
+            contents: workerContents,
+            config: {
+              systemInstruction: 'Você é o Subagente Trabalhador "' + st.label + '" do Aegis Local em ' + os.hostname() + ' (' + (IS_WIN ? 'Windows' : 'Linux') + '). Google: ' + googleContextSummary + '. Execute ferramentas necessárias e devolva um dossiê objetivo e completo em Português.',
+              tools,
+              includeThoughts: true,
+            },
+          });
+          addUsageMeta(wRes.usageMetadata);
+          if (wRes.thoughts) {
+            pushTrace({ kind: 'thought', status: 'done', title: st.label, detail: wRes.thoughts, model: wRes.resolvedModel || st.model, role: 'worker' });
+          }
+          const wCalls = wRes.functionCalls || [];
+          if (wCalls.length === 0) {
+            wOut = (wRes.text || '').trim().slice(0, 2600);
+            break;
+          }
+          if (wRes.candidates?.[0]?.content) workerContents.push(wRes.candidates[0].content);
+          const fnParts = await Promise.all(wCalls.map((c) => executeLocalTool(c, wRes.resolvedModel || st.model)));
+          workerContents.push({ role: 'user', parts: fnParts });
+        }
+      } catch (e) {
+        wErr = true;
+        wOut = 'Erro no trabalhador: ' + e.message;
+      }
+
+      if (wOut) workerDossiers.push('[' + st.label + ']\\n' + wOut);
+      pushTrace({
+        id: wTraceId,
+        kind: 'worker',
+        status: wErr ? 'error' : 'done',
+        title: '#' + (sIdx + 1) + ' · ' + st.label,
+        detail: wOut || 'Subtarefa concluída.',
+        model: st.model,
+        role: 'worker',
+        latencyMs: Date.now() - wStart,
+      });
+    }
+
+    const workerDossier = workerDossiers.join('\\n\\n');
+    const workerHadErrors = steps.some((s) => s.status === 'error') || thinkingTrace.some((t) => t.kind === 'worker' && t.status === 'error');
+
+    // SMART CURATION GATE: avoid heavy curator tokens when Flash Lite workers already nailed a modest demand
+    const canSkipCurator =
+      (effectivePref === 'auto' || effectivePref === 'gemini-3.1-flash-lite') &&
+      Boolean(workerDossier) &&
+      !workerHadErrors &&
+      pendingConfirmations.length === 0 &&
+      (effectivePref === 'gemini-3.1-flash-lite' || route.tier === 'lite' || (route.tier === 'balanced' && subtasks.length === 1 && prompt.length <= 165 && steps.length <= 2));
+
+    if (canSkipCurator) {
+      curationSkipped = true;
+      pushTrace({
+        kind: 'curator',
+        status: 'done',
+        title: 'Curadoria dispensada (economia de tokens)',
+        detail: 'O subagente leve Flash Lite entregou um dossiê completo e sem erros; modelo sênior não precisou ser acionado.',
+        model: 'gemini-3.1-flash-lite',
+        role: 'curator',
+      });
+      const cleanFinal = workerDossiers.length === 1 ? workerDossiers[0].replace(/^\\[[^\\]]+\\]\\n/, '') : workerDossier;
+      const latencyMs = Date.now() - t0;
+      const usageEntry = {
+        model: 'gemini-3.1-flash-lite',
+        routingMode: effectivePref === 'auto' ? 'auto' : 'manual',
+        routingReason: 'Local (' + os.hostname() + ') · Curadoria dispensada (entrega limpa pelos trabalhadores)',
+        complexityTier: route.tier,
+        promptTokens,
+        outputTokens,
+        thoughtsTokens,
+        totalTokens,
+        latencyMs,
+        fallbackUsed: false,
+        escalated: false,
+        curationSkipped: true,
+        workerModels: ['gemini-3.1-flash-lite'],
+        curatorModel: 'gemini-3.1-flash-lite',
+        subtasksCount: subtasks.length,
+      };
+      appendJsonLine(USAGE_FILE, usageEntry);
+      appendJsonLine(MEMORY_FILE, { role: 'assistant', content: cleanFinal, outputs, usage: usageEntry });
+      emitRouting({ phase: 'idle', activeModel: 'gemini-3.1-flash-lite', curatorModel: 'gemini-3.1-flash-lite', tier: route.tier, reason: usageEntry.routingReason });
+      return { reply: cleanFinal, steps, outputs, screens, pendingConfirmations, usage: usageEntry, thinkingTrace };
+    }
+
+    // Right-size curator model when workers succeeded cleanly
+    if (effectivePref === 'auto' && !workerHadErrors && activeModel === 'gemini-4-argon' && steps.length <= 2 && subtasks.length <= 2) {
+      activeModel = 'gemini-4-hydrogen';
+    }
+
+    if (activeModel !== 'gemini-3.1-flash-lite') {
+      escalated = true;
+      emitRouting({ phase: 'escalating', previousModel: 'gemini-3.1-flash-lite', activeModel, curatorModel: activeModel, tier: route.tier, reason: 'Escalonando trabalho bruto para Curadoria Sênior (' + activeModel + ')' });
+      pushTrace({
+        kind: 'escalation',
+        status: 'done',
+        title: 'Escalonamento: Flash Lite → ' + activeModel,
+        detail: workerHadErrors
+          ? 'Trabalhador encontrou obstáculos; promovido para modelo curador mais capaz.'
+          : 'Múltiplas frentes ou complexidade ' + route.tier + ' requerem curadoria e síntese sênior.',
+        model: activeModel,
+        role: 'router',
+      });
+    }
+
+    // STAGE 2: Senior Curator Synthesis & Verification
+    const curatorTraceId = 'curator_' + Date.now();
+    emitRouting({ phase: 'curating', activeModel, curatorModel: activeModel, tier: route.tier, reason: 'Curador Sênior revisando e sintetizando entrega final...' });
+    pushTrace({
+      id: curatorTraceId,
+      kind: 'curator',
+      status: 'running',
+      title: 'Curadoria Sênior · ' + activeModel,
+      detail: 'Auditando dossiê dos trabalhadores, dados locais e Google Workspace.',
+      model: activeModel,
+      role: 'curator',
+    });
+
+    const systemInstruction = 'Você é o Curador Sênior do Aegis Local em ' + os.hostname() + ' (' + (IS_WIN ? 'Windows' : 'Linux') + '). Google: ' + googleContextSummary + '. Pasta sync: ' + GOOGLE_SYNC_DIR + '. Revise criticamente o trabalho dos subagentes, corrija lacunas e entregue uma resposta clara e polida em Português.\\nMemória:\\n- ' + facts;
+    const curatorPrompt = workerDossier
+      ? 'Solicitação do operador:\\n' + prompt + '\\n\\n[DOSSIÊ DOS SUBAGENTES TRABALHADORES]\\n' + workerDossier + '\\n\\nFaça a curadoria final (use ferramentas extras somente se faltar informação crítica).'
+      : prompt;
+
+    const contents = [{ role: 'user', parts: [{ text: curatorPrompt }] }];
+
+    for (let hop = 0; hop < 4; hop++) {
+      let response;
+      try {
+        response = await getAiClient().models.generateContent({
+          model: activeModel,
+          contents,
+          config: { systemInstruction, tools, includeThoughts: true },
+        });
+      } catch (err) {
+        if (activeModel !== 'gemini-4-hydrogen' && activeModel !== 'gemini-3.1-flash-lite' && !fallbackUsed) {
+          const prevM = activeModel;
+          activeModel = 'gemini-4-hydrogen';
+          fallbackUsed = true;
+          emitRouting({ phase: 'fallback', previousModel: prevM, activeModel, curatorModel: activeModel, tier: route.tier, reason: 'Fallback automático de ' + prevM + ' para ' + activeModel });
+          pushTrace({ kind: 'escalation', status: 'done', title: 'Fallback Automático: ' + prevM + ' → ' + activeModel, detail: err.message || 'Alternado automaticamente por resiliência.', model: activeModel, role: 'router' });
+          response = await getAiClient().models.generateContent({
+            model: activeModel,
+            contents,
+            config: { systemInstruction, tools, includeThoughts: true },
+          });
+        } else {
+          throw err;
+        }
+      }
+
+      addUsageMeta(response.usageMetadata);
+      if (response.thoughts) {
+        pushTrace({ kind: 'thought', status: 'done', title: 'Curadoria Sênior', detail: response.thoughts, model: response.resolvedModel || activeModel, role: 'curator' });
+      }
+
+      const calls = response.functionCalls || [];
+      if (calls.length === 0) {
+        const replyText = (response.text || 'Operação concluída.').trim();
+        const latencyMs = Date.now() - t0;
+        const resolvedCurator = response.resolvedModel || activeModel;
+        pushTrace({ id: curatorTraceId, kind: 'curator', status: 'done', title: 'Curadoria Sênior Concluída', detail: 'Revisão final entregue em ' + (latencyMs / 1000).toFixed(1) + 's com ' + totalTokens + ' tokens.', model: resolvedCurator, role: 'curator' });
+        const usageEntry = {
+          model: resolvedCurator,
+          routingMode: route.mode,
+          routingReason: 'Operação Local (' + os.hostname() + ') · ' + route.reason,
+          complexityTier: route.tier,
+          promptTokens,
+          outputTokens,
+          thoughtsTokens,
+          totalTokens,
+          latencyMs,
+          fallbackUsed,
+          escalated,
+          curationSkipped: false,
+          workerModels: ['gemini-3.1-flash-lite'],
+          curatorModel: resolvedCurator,
+          subtasksCount: subtasks.length,
+        };
+        appendJsonLine(USAGE_FILE, usageEntry);
+        appendJsonLine(MEMORY_FILE, { role: 'assistant', content: replyText, outputs, usage: usageEntry });
+        emitRouting({ phase: 'idle', activeModel: resolvedCurator, curatorModel: resolvedCurator, tier: route.tier, reason: usageEntry.routingReason });
+        return { reply: replyText, steps, outputs, screens, pendingConfirmations, usage: usageEntry, thinkingTrace };
+      }
+
+      if (response.candidates?.[0]?.content) contents.push(response.candidates[0].content);
+      const fnParts = await Promise.all(calls.map((c) => executeLocalTool(c, response.resolvedModel || activeModel)));
+      contents.push({ role: 'user', parts: fnParts });
+    }
+
+    const latencyMs = Date.now() - t0;
+    pushTrace({ id: curatorTraceId, kind: 'curator', status: 'done', title: 'Curadoria Sênior Concluída', detail: 'Ciclo de ferramentas encerrado.', model: activeModel, role: 'curator' });
+    const usageEntry = { model: activeModel, routingMode: route.mode, routingReason: route.reason, complexityTier: route.tier, promptTokens, outputTokens, thoughtsTokens, totalTokens, latencyMs, fallbackUsed, escalated, curationSkipped, workerModels: ['gemini-3.1-flash-lite'], curatorModel: activeModel, subtasksCount: subtasks.length };
+    appendJsonLine(USAGE_FILE, usageEntry);
+    emitRouting({ phase: 'idle', activeModel, curatorModel: activeModel, tier: route.tier, reason: usageEntry.routingReason });
+    return { reply: 'Processamento local concluído.', steps, outputs, screens, pendingConfirmations, usage: usageEntry, thinkingTrace };
+  }
+
+  function launchLocalBackgroundJob(promptStr, modelPreference) {
+    const jobId = 'bg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+    const title = promptStr.length > 64 ? promptStr.slice(0, 61) + '...' : promptStr;
+    const job = {
+      id: jobId,
+      title,
+      prompt: promptStr,
+      status: 'running',
+      activeModel: 'gemini-3.1-flash-lite',
+      latestActivity: 'Iniciando trabalhadores em segundo plano...',
+      thinkingTrace: [],
+      reply: null,
+      usage: null,
+      screens: [],
+      pendingConfirmations: [],
+      createdAt: new Date().toISOString(),
+      completedAt: null,
+      error: null,
+    };
+    upsertBackgroundJob(job);
+
+    runLocalOrchestration(
+      { prompt: promptStr, modelPreference },
+      (evName, payload) => {
+        if (evName === 'routing') {
+          if (payload.activeModel) job.activeModel = payload.activeModel;
+          if (payload.reason) job.latestActivity = payload.reason;
+        } else if (evName === 'trace' && Array.isArray(payload.trace)) {
+          job.thinkingTrace = payload.trace.slice();
+          if (payload.entry?.title) job.latestActivity = payload.entry.title;
+        }
+      }
+    )
+      .then((result) => {
+        job.status = 'completed';
+        job.reply = result.reply;
+        job.usage = result.usage;
+        job.screens = result.screens || [];
+        job.pendingConfirmations = result.pendingConfirmations || [];
+        job.thinkingTrace = result.thinkingTrace || job.thinkingTrace;
+        job.activeModel = result.usage?.model || job.activeModel;
+        job.latestActivity = 'Concluído (' + (result.usage?.totalTokens || 0) + ' tok) — entregue no chat';
+        job.completedAt = new Date().toISOString();
+      })
+      .catch((err) => {
+        job.status = 'failed';
+        job.error = err.message || 'Erro na tarefa em segundo plano.';
+        job.latestActivity = 'Falhou: ' + job.error;
+        job.completedAt = new Date().toISOString();
+      });
+
+    return job;
+  }
+
+  if (pathname === '/command/stream' && req.method === 'POST') {
+    const body = await readBody(req);
+    const { prompt, modelPreference, forceBackground = false, forceForeground = false, googleEmail } = body;
+    const authHeader = req.headers.authorization || '';
+    const bearerTok = /^Bearer\\s+(.+)$/i.test(authHeader) ? authHeader.replace(/^Bearer\\s+/i, '').trim() : '';
+    if (bearerTok && bearerTok !== CLI_TOKEN && !activeSessions.has(bearerTok)) {
+      const c = loadCloudConnections();
+      c.google = { token: bearerTok, email: googleEmail || c.google?.email || 'Google User', updatedAt: new Date().toISOString() };
+      saveCloudConnections(c);
+    }
+
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+    });
+    const sendSse = (event, data) => {
+      try {
+        res.write('event: ' + event + '\\ndata: ' + JSON.stringify(data) + '\\n\\n');
+      } catch {}
+    };
+
+    try {
+      const bgCheck = !forceForeground ? shouldRunLocalInBackground(prompt, forceBackground) : { shouldRunInBackground: false };
+      if (bgCheck.shouldRunInBackground) {
+        const job = launchLocalBackgroundJob(String(prompt || '').trim(), modelPreference);
+        sendSse('background_started', { job, reason: bgCheck.reason });
+        sendSse('final', {
+          backgroundJob: job,
+          reply: 'Movi esta demanda para **segundo plano** (' + job.id + ') para não travar sua conversa. Acompanhe pelo botão **2º Plano** no topo; assim que os subagentes e o curador concluírem, entregarei o resultado aqui automaticamente.',
+        });
+        return res.end();
+      }
+      const result = await runLocalOrchestration({ prompt, modelPreference }, sendSse);
+      sendSse('final', result);
+    } catch (err) {
+      sendSse('error', { error: err.message || 'Erro ao processar comando local.' });
+    }
+    return res.end();
+  }
+
+  if (pathname === '/command' && req.method === 'POST') {
+    const { prompt, confirmedCommand, confirmedWebLogin, confirmedGoogleUpload, modelPreference, forceBackground = false, forceForeground = false, googleEmail } = await readBody(req);
     const authHeader = req.headers.authorization || '';
     const bearerTok = /^Bearer\\s+(.+)$/i.test(authHeader) ? authHeader.replace(/^Bearer\\s+/i, '').trim() : '';
 
-    if (bearerTok) {
+    if (bearerTok && bearerTok !== CLI_TOKEN && !activeSessions.has(bearerTok)) {
       const c = loadCloudConnections();
       c.google = { token: bearerTok, email: googleEmail || c.google?.email || 'Google User', updatedAt: new Date().toISOString() };
       saveCloudConnections(c);
@@ -1567,332 +2408,22 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 200, { executed: true, command: confirmedCommand, stdout, stderr, exitCode, summary });
       }
 
-      appendJsonLine(MEMORY_FILE, { role: 'user', content: prompt });
-      const route = selectModel(prompt, modelPreference);
-      const curatorModel = route.model === 'gemini-3.1-flash-lite' && modelPreference === 'auto' && String(prompt || '').trim().length > 24
-        ? 'gemini-4-hydrogen'
-        : route.model;
-      let activeModel = curatorModel;
-      let fallbackUsed = false;
-      const facts = loadFacts().slice(0, 6).map((f) => f.content.slice(0, 140)).join('\\n- ');
-      const cloud = loadCloudConnections();
-      const gCache = loadGoogleSyncCache();
-
-      const thinkingTrace = [];
-      const addTrace = (kind, title, detail, model, role) => {
-        thinkingTrace.push({ id: 'lt_' + Date.now() + '_' + thinkingTrace.length, kind, title, detail, model, role, timestamp: new Date().toISOString() });
-      };
-
-      const pendingConfirmations = [];
-      const outputs = [];
-      const screens = [];
-      const steps = [];
-      let promptTokens = 0, outputTokens = 0, totalTokens = 0;
-
-      const googleContextSummary = cloud.google?.token
-        ? 'Conectado (' + cloud.google.email + ') · Última sync: ' + (gCache.lastSyncAt || 'agora') + ' · Cache: ' + (gCache.drive?.length || 0) + ' arq Drive, ' + (gCache.gmail?.length || 0) + ' e-mails, ' + (gCache.calendar?.length || 0) + ' eventos, ' + (gCache.tasks?.length || 0) + ' tarefas.'
-        : 'Desconectado';
-
-      const executeLocalTool = async (call) => {
-        let toolResult = {};
-        let status = 'executed';
-        try {
-          if (call.name === 'memory_remember' && call.args?.fact) {
-            saveFact(String(call.args.fact));
-            toolResult = { ok: true, saved: call.args.fact };
-            outputs.push({ tool: 'memory_remember', saved: call.args.fact });
-          } else if (call.name === 'draw_holographic_screen') {
-            const scr = {
-              id: 'scr_' + Date.now() + '_' + screens.length,
-              kind: String(call.args?.kind || 'interactive_dashboard'),
-              title: String(call.args?.title || 'Projeção Aegis Local'),
-              content: call.args?.content ? String(call.args.content) : '',
-              htmlCode: call.args?.htmlCode ? String(call.args.htmlCode) : '',
-              createdAt: new Date().toISOString(),
-            };
-            screens.push(scr);
-            toolResult = { ok: true, screenId: scr.id, message: 'Tela holográfica projetada.' };
-            outputs.push({ tool: 'draw_holographic_screen', title: scr.title, kind: scr.kind });
-          } else if (call.name === 'local_write_file') {
-            const targetFile = path.resolve(HOME, String(call.args?.path || ''));
-            fs.mkdirSync(path.dirname(targetFile), { recursive: true });
-            fs.writeFileSync(targetFile, String(call.args?.content || ''), 'utf-8');
-            toolResult = { ok: true, path: targetFile };
-            outputs.push({ tool: 'local_write_file', path: targetFile });
-          } else if (call.name === 'local_open_app') {
-            const tgt = String(call.args?.target || '').trim();
-            if (IS_WIN) await execNative('Start-Process ' + JSON.stringify(tgt));
-            else await execNative('nohup xdg-open ' + JSON.stringify(tgt) + ' >/dev/null 2>&1 &');
-            toolResult = { ok: true, opened: tgt };
-            outputs.push({ tool: 'local_open_app', target: tgt });
-          } else if (call.name === 'local_search') {
-            const dir = String(call.args?.directory || HOME).replace(/^~/, HOME);
-            const pat = String(call.args?.pattern || '');
-            const searchCmd = IS_WIN
-              ? 'Get-ChildItem -Path ' + JSON.stringify(dir) + ' -Recurse -Depth 3 -Filter "*' + pat + '*" -ErrorAction SilentlyContinue | Select-Object -First 30 -ExpandProperty FullName'
-              : 'find "' + dir + '" -maxdepth 3 -iname "*' + pat + '*" 2>/dev/null | head -n 30';
-            const { stdout } = await execNative(searchCmd);
-            toolResult = { ok: true, stdout };
-            outputs.push({ tool: 'local_search', stdout });
-          } else if (call.name === 'local_exec') {
-            const cmd = String(call.args?.command || '');
-            const cwd = call.args?.cwd ? String(call.args.cwd).replace(/^~/, HOME) : HOME;
-            if (isMutating(cmd)) {
-              status = 'awaiting_confirmation';
-              pendingConfirmations.push({ id: 'lconf_' + Date.now(), type: 'command', action_type: 'local_exec', target: cmd, summary: 'Executar comando destrutivo local: ' + cmd, command: cmd, reason: 'Ação destrutiva requer confirmação' });
-              toolResult = { status: 'AWAITING_USER_CONFIRMATION', command: cmd };
-            } else {
-              const { stdout, stderr } = await execNative(cmd, cwd);
-              toolResult = { ok: true, cmd, stdout: String(stdout || '').slice(0, 6000), stderr: String(stderr || '').slice(0, 2000), exitCode: 0 };
-              outputs.push({ tool: 'local_exec', cmd, stdout, stderr });
-            }
-          } else if (call.name === 'web_navigate') {
-            const snap = await webNavigate(String(call.args?.url || ''));
-            toolResult = { ok: snap.status < 400, url: snap.url, title: snap.title, status: snap.status, textPreview: snap.textPreview.slice(0, 3000), links: snap.links.slice(0, 10) };
-            outputs.push({ tool: 'web_navigate', url: snap.url, title: snap.title });
-          } else if (call.name === 'web_login') {
-            status = 'awaiting_confirmation';
-            pendingConfirmations.push({ id: 'lconf_' + Date.now(), type: 'web_login', action_type: 'web_login', target: String(call.args?.siteOrId || call.args?.loginUrl || 'site'), summary: 'Login web em ' + (call.args?.siteOrId || call.args?.loginUrl || 'site'), payload: call.args || {}, command: 'Login web em ' + (call.args?.siteOrId || call.args?.loginUrl || 'site') });
-            toolResult = { status: 'AWAITING_USER_CONFIRMATION' };
-          } else if (call.name === 'google_list_recent') {
-            const activeCloud = loadCloudConnections();
-            if (!activeCloud.google?.token) {
-              toolResult = { ok: false, error: 'Google não sincronizado no daemon local. Sincronize sua conta Google no painel Aegis.' };
-            } else {
-              const svc = String(call.args?.service || 'all').toLowerCase();
-              if (svc === 'all') {
-                const snap = await runFullGoogleWorkspaceSync(activeCloud.google.token, activeCloud.google.email);
-                toolResult = { ok: true, syncedAt: snap.lastSyncAt, drive: snap.drive.slice(0, 12), gmail: snap.gmail.slice(0, 6), calendar: snap.calendar.slice(0, 8), tasks: snap.tasks.slice(0, 10) };
-              } else if (svc === 'drive') {
-                const fId = call.args?.folderId ? String(call.args.folderId) : 'root';
-                const r = await fetch("https://www.googleapis.com/drive/v3/files?pageSize=20&orderBy=folder,name&fields=files(id,name,mimeType,modifiedTime)&q=trashed%20%3D%20false%20and%20'" + encodeURIComponent(fId) + "'%20in%20parents", { headers: { Authorization: 'Bearer ' + activeCloud.google.token } });
-                toolResult = { ok: r.ok, data: await r.json() };
-              } else if (svc === 'calendar') {
-                const r = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events?maxResults=12&singleEvents=true&orderBy=startTime&timeMin=' + encodeURIComponent(new Date().toISOString()), { headers: { Authorization: 'Bearer ' + activeCloud.google.token } });
-                toolResult = { ok: r.ok, data: await r.json() };
-              } else if (svc === 'tasks') {
-                const r = await fetch('https://tasks.googleapis.com/tasks/v1/lists/@default/tasks?maxResults=15&showCompleted=false', { headers: { Authorization: 'Bearer ' + activeCloud.google.token } });
-                toolResult = { ok: r.ok, data: await r.json() };
-              } else {
-                const r = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=8', { headers: { Authorization: 'Bearer ' + activeCloud.google.token } });
-                toolResult = { ok: r.ok, data: await r.json() };
-              }
-            }
-            outputs.push({ tool: 'google_list_recent', ok: Boolean(toolResult.ok) });
-          } else if (call.name === 'google_drive_download_local') {
-            const activeCloud = loadCloudConnections();
-            if (!activeCloud.google?.token) {
-              toolResult = { ok: false, error: 'Google não sincronizado no daemon local.' };
-            } else {
-              const fId = String(call.args?.fileId || '');
-              const metaR = await fetch('https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(fId) + '?fields=id,name,mimeType', { headers: { Authorization: 'Bearer ' + activeCloud.google.token } });
-              const meta = await metaR.json();
-              let dlUrl = 'https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(fId) + '?alt=media';
-              let safeName = String(meta.name || fId).replace(/[\\\\/:*?"<>|]/g, '_');
-              if (meta.mimeType === 'application/vnd.google-apps.document') { dlUrl = 'https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(fId) + '/export?mimeType=text/plain'; safeName += '.txt'; }
-              else if (meta.mimeType === 'application/vnd.google-apps.spreadsheet') { dlUrl = 'https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(fId) + '/export?mimeType=text/csv'; safeName += '.csv'; }
-              const dlR = await fetch(dlUrl, { headers: { Authorization: 'Bearer ' + activeCloud.google.token } });
-              const buf = Buffer.from(await dlR.arrayBuffer());
-              const destDir = call.args?.targetDir ? path.resolve(HOME, String(call.args.targetDir).replace(/^~/, HOME)) : GOOGLE_SYNC_DIR;
-              fs.mkdirSync(destDir, { recursive: true });
-              const savedPath = path.join(destDir, safeName);
-              fs.writeFileSync(savedPath, buf);
-              toolResult = { ok: true, savedPath, bytes: buf.length };
-            }
-          } else if (call.name === 'google_drive_upload_local') {
-            status = 'awaiting_confirmation';
-            pendingConfirmations.push({ id: 'lconf_' + Date.now(), type: 'google_upload', action_type: 'google_drive_upload_local', target: String(call.args?.localPath || ''), summary: 'Enviar arquivo local "' + String(call.args?.localPath || '') + '" ao Google Drive', payload: call.args || {} });
-            toolResult = { status: 'AWAITING_USER_CONFIRMATION' };
-          }
-        } catch (toolErr) {
-          status = 'error';
-          toolResult = { ok: false, error: toolErr.message };
-        }
-        steps.push({ tool: call.name, args: call.args || {}, status, result: toolResult });
-        addTrace('tool', call.name, status === 'executed' ? 'Executado localmente com sucesso.' : (toolResult.error || 'Aguardando confirmação'), activeModel, 'worker');
-        return { functionResponse: { id: call.id, name: call.name, response: toolResult } };
-      };
-
-      // STAGE 1: Lightweight Local Worker ("Trabalho Bruto" with Flash Lite) + Smart Curation Gating
-      let workerDossier = '';
-      const trimmedPrompt = String(prompt || '').trim();
-      const isTrivial = /^(oi|olá|ola|bom dia|boa tarde|boa noite|ok|obrigado|valeu|ping|teste)[\\s!?.]*$/i.test(trimmedPrompt);
-      const needsToolHint = /(arquivo|pasta|home|download|disco|cpu|ram|memória|memoria|processo|serviço|servico|comando|terminal|bash|exec|abrir|abre|site|url|http|login|drive|gmail|email|e-mail|agenda|calendário|calendario|tarefa|tasks|android|adb|google|sincron)/i.test(trimmedPrompt);
-
-      // Direct ultra-economical turn for simple conversational questions (no tools, no curator overhead)
-      if ((isTrivial || (route.tier === 'lite' && !needsToolHint && trimmedPrompt.length <= 160)) && modelPreference === 'auto') {
-        const directRes = await getAiClient().models.generateContent({
-          model: 'gemini-3.1-flash-lite',
-          contents: [{ role: 'user', parts: [{ text: trimmedPrompt }] }],
-          config: {
-            systemInstruction: 'Você é o Aegis Local em ' + os.hostname() + '. Responda em Português de forma direta e concisa.',
-          },
+      const bgCheck = !forceForeground ? shouldRunLocalInBackground(prompt, forceBackground) : { shouldRunInBackground: false };
+      if (bgCheck.shouldRunInBackground) {
+        const job = launchLocalBackgroundJob(String(prompt || '').trim(), modelPreference);
+        return sendJson(res, 200, {
+          backgroundJob: job,
+          reply: 'Movi esta demanda para segundo plano (' + job.id + ') para não travar o chat. Assim que finalizar, o resultado será entregue automaticamente.',
+          steps: [],
+          outputs: [],
+          screens: [],
+          pendingConfirmations: [],
+          thinkingTrace: [],
         });
-        if (directRes.usageMetadata) {
-          promptTokens += directRes.usageMetadata.promptTokenCount || 0;
-          outputTokens += directRes.usageMetadata.candidatesTokenCount || 0;
-          totalTokens += directRes.usageMetadata.totalTokenCount || 0;
-        }
-        const replyText = (directRes.text || 'Pronto.').trim();
-        const latencyMs = Date.now() - t0;
-        const usageEntry = {
-          model: 'gemini-3.1-flash-lite',
-          routingMode: 'auto',
-          routingReason: 'Resposta direta econômica (sem curadoria extra)',
-          complexityTier: 'lite',
-          promptTokens,
-          outputTokens,
-          thoughtsTokens: 0,
-          totalTokens,
-          latencyMs,
-          fallbackUsed: false,
-          workerModels: [],
-          curatorModel: 'gemini-3.1-flash-lite',
-          subtasksCount: 0,
-        };
-        appendJsonLine(USAGE_FILE, usageEntry);
-        appendJsonLine(MEMORY_FILE, { role: 'assistant', content: replyText, outputs, usage: usageEntry });
-        return sendJson(res, 200, { reply: replyText, steps, outputs, screens, pendingConfirmations, usage: usageEntry, thinkingTrace });
       }
 
-      let workerHadErrors = false;
-      if (!isTrivial) {
-        addTrace('plan', 'Orquestração Local (Trabalhador → Curadoria Inteligente)', 'Subagente Flash Lite executando coleta local/Google; curadoria acionada apenas se necessário', 'gemini-3.1-flash-lite', 'decomposer');
-        const workerContents = [{ role: 'user', parts: [{ text: 'Execute a coleta/ação local ou Google para atender:\\n' + trimmedPrompt }] }];
-        for (let wHop = 0; wHop < 2; wHop++) {
-          const wRes = await getAiClient().models.generateContent({
-            model: 'gemini-3.1-flash-lite',
-            contents: workerContents,
-            config: {
-              systemInstruction: 'Você é o Subagente Trabalhador Local do Aegis em ' + os.hostname() + ' (' + os.platform() + '). Google: ' + googleContextSummary + '. Execute ferramentas necessárias e responda de forma clara e factual em Português.',
-              tools,
-            },
-          });
-          if (wRes.usageMetadata) {
-            promptTokens += wRes.usageMetadata.promptTokenCount || 0;
-            outputTokens += wRes.usageMetadata.candidatesTokenCount || 0;
-            totalTokens += wRes.usageMetadata.totalTokenCount || 0;
-          }
-          const wCalls = wRes.functionCalls || [];
-          if (wCalls.length === 0) {
-            workerDossier = (wRes.text || '').trim().slice(0, 2200);
-            addTrace('subagent', 'Trabalhador Local Concluído', workerDossier.slice(0, 180) || 'Coleta finalizada.', 'gemini-3.1-flash-lite', 'worker');
-            break;
-          }
-          if (wRes.candidates?.[0]?.content) workerContents.push(wRes.candidates[0].content);
-          const fnParts = await Promise.all(wCalls.map((c) => executeLocalTool(c)));
-          workerContents.push({ role: 'user', parts: fnParts });
-        }
-        workerHadErrors = steps.some((s) => s.status === 'error');
-      }
-
-      // SMART CURATION GATE: skip redundant Senior Curator when Flash Lite already succeeded cleanly on a modest task
-      const canSkipCurator =
-        modelPreference === 'auto' &&
-        Boolean(workerDossier) &&
-        !workerHadErrors &&
-        pendingConfirmations.length === 0 &&
-        (route.tier === 'lite' || (route.tier === 'balanced' && trimmedPrompt.length <= 160 && steps.length <= 2));
-
-      if (canSkipCurator) {
-        addTrace('curator', 'Curadoria dispensada (economia de tokens)', 'O trabalhador Flash Lite concluiu a demanda limpa sem erros; curadoria sênior não foi necessária.', 'gemini-3.1-flash-lite', 'curator');
-        const latencyMs = Date.now() - t0;
-        const usageEntry = {
-          model: 'gemini-3.1-flash-lite',
-          routingMode: 'auto',
-          routingReason: 'Local (' + os.hostname() + ') · Curadoria dispensada (entrega limpa pelo trabalhador)',
-          complexityTier: route.tier,
-          promptTokens,
-          outputTokens,
-          thoughtsTokens: 0,
-          totalTokens,
-          latencyMs,
-          fallbackUsed: false,
-          workerModels: ['gemini-3.1-flash-lite'],
-          curatorModel: 'gemini-3.1-flash-lite',
-          subtasksCount: 1,
-        };
-        appendJsonLine(USAGE_FILE, usageEntry);
-        appendJsonLine(MEMORY_FILE, { role: 'assistant', content: workerDossier, outputs, usage: usageEntry });
-        return sendJson(res, 200, { reply: workerDossier, steps, outputs, screens, pendingConfirmations, usage: usageEntry, thinkingTrace });
-      }
-
-      // Right-size curator model if worker returned clean data
-      if (modelPreference === 'auto' && !workerHadErrors && activeModel === 'gemini-4-argon' && steps.length <= 2) {
-        activeModel = 'gemini-4-hydrogen';
-      }
-
-      // STAGE 2: Senior Curator Synthesis & Verification (only when truly needed)
-      addTrace('curator', 'Curadoria Sênior Local', 'Auditando dados locais e Google Workspace com ' + activeModel, activeModel, 'curator');
-      const systemInstruction = 'Você é o Aegis Local em ' + os.hostname() + ' (' + (IS_WIN ? 'Windows' : 'Linux') + '). Google: ' + googleContextSummary + '. Pasta sync: ' + GOOGLE_SYNC_DIR + '. Responda objetivamente em Português.\\nMemória:\\n- ' + facts;
-
-      const curatorPrompt = workerDossier
-        ? 'Solicitação:\\n' + trimmedPrompt + '\\n\\n[DOSSIÊ LOCAL]\\n' + workerDossier + '\\n\\nRevise e entregue a resposta final polida (use ferramentas extras apenas se faltar algo).'
-        : trimmedPrompt;
-
-      const contents = [{ role: 'user', parts: [{ text: curatorPrompt }] }];
-
-      for (let hop = 0; hop < 4; hop++) {
-        let response;
-        try {
-          response = await getAiClient().models.generateContent({
-            model: activeModel,
-            contents,
-            config: { systemInstruction, tools },
-          });
-        } catch (err) {
-          if (activeModel !== 'gemini-4-hydrogen' && activeModel !== 'gemini-3.1-flash-lite' && !fallbackUsed) {
-            activeModel = 'gemini-4-hydrogen';
-            fallbackUsed = true;
-            response = await getAiClient().models.generateContent({
-              model: activeModel,
-              contents,
-              config: { systemInstruction, tools },
-            });
-          } else {
-            throw err;
-          }
-        }
-
-        if (response.usageMetadata) {
-          promptTokens += response.usageMetadata.promptTokenCount || 0;
-          outputTokens += response.usageMetadata.candidatesTokenCount || 0;
-          totalTokens += response.usageMetadata.totalTokenCount || 0;
-        }
-
-        const calls = response.functionCalls || [];
-        if (calls.length === 0) {
-          const replyText = (response.text || 'Operação concluída.').trim();
-          const latencyMs = Date.now() - t0;
-          const usageEntry = {
-            model: activeModel,
-            routingMode: route.mode,
-            routingReason: 'Operação Local (' + os.hostname() + ') · ' + route.reason,
-            complexityTier: route.tier,
-            promptTokens,
-            outputTokens,
-            thoughtsTokens: 0,
-            totalTokens,
-            latencyMs,
-            fallbackUsed,
-            workerModels: isTrivial ? [] : ['gemini-3.1-flash-lite'],
-            curatorModel: activeModel,
-            subtasksCount: isTrivial ? 0 : 1,
-          };
-          appendJsonLine(USAGE_FILE, usageEntry);
-          appendJsonLine(MEMORY_FILE, { role: 'assistant', content: replyText, outputs, usage: usageEntry });
-          return sendJson(res, 200, { reply: replyText, steps, outputs, screens, pendingConfirmations, usage: usageEntry, thinkingTrace });
-        }
-
-        if (response.candidates?.[0]?.content) contents.push(response.candidates[0].content);
-        const fnParts = await Promise.all(calls.map((c) => executeLocalTool(c)));
-        contents.push({ role: 'user', parts: fnParts });
-      }
-
-      const latencyMs = Date.now() - t0;
-      const usageEntry = { model: activeModel, routingMode: route.mode, routingReason: route.reason, complexityTier: route.tier, promptTokens, outputTokens, thoughtsTokens: 0, totalTokens, latencyMs, fallbackUsed, workerModels: isTrivial ? [] : ['gemini-3.1-flash-lite'], curatorModel: activeModel, subtasksCount: isTrivial ? 0 : 1 };
-      appendJsonLine(USAGE_FILE, usageEntry);
-      return sendJson(res, 200, { reply: 'Processamento local concluído.', steps, outputs, screens, pendingConfirmations, usage: usageEntry, thinkingTrace });
+      const result = await runLocalOrchestration({ prompt, modelPreference }, null);
+      return sendJson(res, 200, result);
     } catch (err) {
       return sendJson(res, 500, { error: err.message });
     }
@@ -2231,7 +2762,11 @@ Type=Application
 Categories=Utility;System;
 `;
 
-const LOCAL_UI_HTML = getLocalHoloUiHtml({ platformMode: 'desktop', appVersion: '2.1.0' });
+const LOCAL_UI_HTML = getLocalHoloUiHtml({
+  platformMode: 'desktop',
+  appVersion: '2.1.0',
+  defaultCloudOrigin: process.env.APP_URL || 'https://ais-pre-gamd6ug3axhvddvr55mbne-702819737353.us-east1.run.app',
+});
 
 const README_MD = `# Aegis — Assistente Local Linux + Google Workspace
 

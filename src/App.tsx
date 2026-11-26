@@ -811,6 +811,78 @@ export default function App() {
     }
   };
 
+  const localBridgeParams = typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : null;
+  const isLocalGoogleConnectBridge = localBridgeParams?.get('aegis_local_google_connect') === '1';
+  const rawReturnTo = localBridgeParams?.get('return_to') || 'http://127.0.0.1:3847/google/oauth/receive';
+  const safeLocalReturnTo = /^http:\/\/(127\.0\.0\.1|localhost)(:\d{2,5})?\/google\/oauth\/receive$/i.test(rawReturnTo)
+    ? rawReturnTo
+    : 'http://127.0.0.1:3847/google/oauth/receive';
+
+  if (isLocalGoogleConnectBridge) {
+    const forwardTokenToLocal = (token: string, email?: string | null) => {
+      const hash = new URLSearchParams();
+      hash.set('access_token', token);
+      if (email) hash.set('email', email);
+      window.location.href = `${safeLocalReturnTo}#${hash.toString()}`;
+    };
+
+    const handleLocalBridgeGoogleClick = async () => {
+      try {
+        const res = await googleSignIn();
+        if (res.accessToken) {
+          forwardTokenToLocal(res.accessToken, res.user.email || res.user.displayName);
+        }
+      } catch (err: unknown) {
+        setAuthError(err instanceof Error ? err.message : 'Falha ao autenticar com Google.');
+      }
+    };
+
+    return (
+      <div className="flex h-screen w-full items-center justify-center bg-[#05070B] p-6 text-slate-100">
+        <div className="w-full max-w-md rounded-2xl border border-amber-500/35 bg-[#0A0F1A] p-7 shadow-2xl space-y-5 text-center">
+          <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-xl border border-amber-400/40 bg-amber-500/15 text-amber-300">
+            <Cloud className="h-6 w-6" />
+          </div>
+          <div className="space-y-1.5">
+            <h1 className="font-display text-lg font-bold text-slate-100">
+              Conectar Google ao Aegis Local
+            </h1>
+            <p className="text-xs leading-relaxed text-slate-400">
+              Autorize sua conta Google (Drive, Gmail, Agenda, Docs, Planilhas e Tarefas) para enviar a credencial com segurança direto para o seu aplicativo local em <code className="text-amber-300">127.0.0.1:3847</code>.
+            </p>
+          </div>
+          {authError && (
+            <div className="rounded-xl border border-rose-500/35 bg-rose-500/10 px-3 py-2 text-xs text-rose-200">
+              {authError}
+            </div>
+          )}
+          <div className="space-y-2.5">
+            {accessToken && (
+              <button
+                type="button"
+                onClick={() => forwardTokenToLocal(accessToken, googleUser?.email || aegisUser?.email)}
+                className="w-full rounded-xl bg-emerald-500 px-4 py-3 text-xs font-semibold text-slate-950 hover:bg-emerald-400 transition-colors cursor-pointer"
+              >
+                Usar Sessão Google Atual ({googleUser?.email || aegisUser?.email || 'Conectado'})
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => void handleLocalBridgeGoogleClick()}
+              className="gsi-material-button"
+            >
+              <div className="gsi-material-button-content-wrapper">
+                <span className="gsi-material-button-contents">
+                  Entrar com Google e Sincronizar Aegis Local
+                </span>
+              </div>
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   if (authLoading) {
     return (
       <div className="flex h-screen w-full items-center justify-center bg-[#05070B] text-xs font-mono text-amber-300/80">

@@ -2023,7 +2023,11 @@ dependencies {
 
   root.file(
     'app/src/main/assets/aegis_hud.html',
-    getLocalHoloUiHtml({ platformMode: 'android', appVersion: APP_VERSION })
+    getLocalHoloUiHtml({
+      platformMode: 'android',
+      appVersion: APP_VERSION,
+      defaultCloudOrigin: process.env.APP_URL || 'https://ais-pre-gamd6ug3axhvddvr55mbne-702819737353.us-east1.run.app',
+    })
   );
 
   root.file(
