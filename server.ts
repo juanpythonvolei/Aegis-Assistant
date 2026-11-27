@@ -1134,10 +1134,12 @@ async function startServer() {
   // NATIVE OS APPLICATION PACKAGES (LINUX / WINDOWS / ANDROID)
   // ==========================================
 
+  const DEFAULT_GITHUB_REPO = 'juanpythonvolei/Aegis-Assistant';
+
   const getConfiguredGithubRepo = (): string | null => {
     const stored = memory.getAppSetting('github_repo');
     if (stored) return nativePackages.normalizeGithubRepo(stored);
-    return nativePackages.normalizeGithubRepo(process.env.AEGIS_GITHUB_REPO);
+    return nativePackages.normalizeGithubRepo(process.env.AEGIS_GITHUB_REPO || DEFAULT_GITHUB_REPO);
   };
 
   app.get('/api/installers/catalog', async (req: Request, res: Response) => {

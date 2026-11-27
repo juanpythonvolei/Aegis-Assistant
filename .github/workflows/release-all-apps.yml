@@ -10,7 +10,7 @@ on:
       server_origin:
         description: 'URL do servidor Aegis (opcional, ex: https://seu-app.run.app)'
         required: false
-        default: 'https://aegis.local'
+        default: 'https://ais-pre-gamd6ug3axhvddvr55mbne-702819737353.us-east1.run.app'
   push:
     tags:
       - 'v*'
@@ -30,10 +30,10 @@ jobs:
           node-version: 22
 
       - name: Install Node dependencies
-        run: npm ci || npm install
+        run: npm install --legacy-peer-deps --ignore-scripts
 
       - name: Export Android Kotlin project
-        run: npx tsx scripts/export-native-kits.ts --target android --out build-kits --origin "${{ inputs.server_origin || 'https://aegis.local' }}"
+        run: npx tsx scripts/export-native-kits.ts --target android --out build-kits --origin "${{ inputs.server_origin || 'https://ais-pre-gamd6ug3axhvddvr55mbne-702819737353.us-east1.run.app' }}"
 
       - uses: actions/setup-java@v4
         with:
@@ -67,10 +67,10 @@ jobs:
           node-version: 22
 
       - name: Install Node dependencies
-        run: npm ci || npm install
+        run: npm install --legacy-peer-deps --ignore-scripts
 
       - name: Export Windows native project
-        run: npx tsx scripts/export-native-kits.ts --target windows --out build-kits --origin "${{ inputs.server_origin || 'https://aegis.local' }}"
+        run: npx tsx scripts/export-native-kits.ts --target windows --out build-kits --origin "${{ inputs.server_origin || 'https://ais-pre-gamd6ug3axhvddvr55mbne-702819737353.us-east1.run.app' }}"
 
       - name: Compile C# WinForms AegisDesktop.exe
         shell: powershell
@@ -83,6 +83,7 @@ jobs:
           }
 
       - name: Build Electron NSIS Installer (.exe)
+        continue-on-error: true
         shell: powershell
         run: |
           $electronDir = Get-ChildItem -Path build-kits\windows -Recurse -Directory -Filter "electron-app" | Select-Object -First 1
@@ -112,11 +113,11 @@ jobs:
           node-version: 22
 
       - name: Install Node dependencies
-        run: npm ci || npm install
+        run: npm install --legacy-peer-deps --ignore-scripts
 
       - name: Compile Linux ELF, .DEB, .AppImage and .TAR.GZ
         run: |
-          npx tsx scripts/export-native-kits.ts --target linux --out build-kits --origin "${{ inputs.server_origin || 'https://aegis.local' }}"
+          npx tsx scripts/export-native-kits.ts --target linux --out build-kits --origin "${{ inputs.server_origin || 'https://ais-pre-gamd6ug3axhvddvr55mbne-702819737353.us-east1.run.app' }}"
           mkdir -p dist-release
           cp build-kits/linux/aegis-desktop_2.1.0_amd64.deb dist-release/
           cp build-kits/linux/AegisDesktop-2.1.0-x86_64.AppImage dist-release/
