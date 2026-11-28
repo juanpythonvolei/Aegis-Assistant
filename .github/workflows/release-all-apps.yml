@@ -78,21 +78,27 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist-release | Out-Null
           $csc = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
           $src = Get-ChildItem -Path build-kits\windows -Recurse -Filter "AegisDesktop.cs" | Select-Object -First 1
-          if (Test-Path $csc -and $src) {
-            & $csc /nologo /target:winexe /optimize+ /out:"dist-release\AegisDesktop-2.1.0.exe" /r:System.Windows.Forms.dll /r:System.Drawing.dll $src.FullName
+          if ((Test-Path $csc) -and ($null -ne $src)) {
+            & $csc /nologo /utf8output /target:winexe /optimize+ /out:"dist-release\AegisDesktop-2.1.0.exe" /r:System.dll /r:System.Windows.Forms.dll /r:System.Drawing.dll $src.FullName
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } else {
+            Write-Error "csc.exe ou AegisDesktop.cs nao encontrado"
+            exit 1
           }
 
       - name: Build Electron NSIS Installer (.exe)
         continue-on-error: true
         shell: powershell
         run: |
-          $electronDir = Get-ChildItem -Path build-kits\windows -Recurse -Directory -Filter "electron-app" | Select-Object -First 1
-          if ($electronDir) {
+          $electronDir = Get-ChildItem -Path build-kits\windows -Recurse -Directory -Filter "electron-installer" | Select-Object -First 1
+          if ($null -ne $electronDir) {
             Push-Location $electronDir.FullName
-            npm install
+            npm install --legacy-peer-deps
             npm run build:win
-            Get-ChildItem -Path dist-installers -Filter "*.exe" | ForEach-Object {
-              Copy-Item $_.FullName -Destination "$env:GITHUB_WORKSPACE\dist-release\AegisDesktop-Setup-2.1.0.exe" -Force
+            if (Test-Path "dist-installers") {
+              Get-ChildItem -Path dist-installers -Filter "*.exe" | ForEach-Object {
+                Copy-Item $_.FullName -Destination "$env:GITHUB_WORKSPACE\dist-release\AegisDesktop-Setup-2.1.0.exe" -Force
+              }
             }
             Pop-Location
           }
@@ -143,6 +149,7 @@ jobs:
   publish-release:
     name: Publish GitHub Release (Links to Download Buttons)
     needs: [build-android-apk, build-windows-exe, build-linux-native]
+    if: ${{ always() && (needs.build-android-apk.result == 'success' || needs.build-windows-exe.result == 'success' || needs.build-linux-native.result == 'success') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -173,7 +180,7 @@ jobs:
             ## Aplicativos Nativos Compilados do Aegis (${{ steps.tag.outputs.name }})
             - **Android**: `AegisAndroid-2.1.0.apk`
             - **Windows 10/11**: `AegisDesktop-Setup-2.1.0.exe` e `AegisDesktop-2.1.0.exe`
-            - **Linux**: `aegis-desktop_2.1.0_amd64.deb`, `AegisDesktop-2.1.0.AppImage`, `aegis-desktop-linux-x64.tar.gz` e binário ELF `aegis-desktop`
+            - **Linux**: `aegis-desktop_2.1.0_amd64.deb`, `AegisDesktop-2.1.0-x86_64.AppImage`, `AegisDesktop-Electron-2.1.0.AppImage`, `aegis-desktop-linux-x64.tar.gz` e binário ELF `aegis-desktop`
 
             Todos os binários acima são vinculados automaticamente aos botões de download na aba **Apps Nativos** do Aegis.
           files: release-assets/*

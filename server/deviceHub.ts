@@ -125,6 +125,57 @@ export function broadcastOperatorEvent(event: string, payload: unknown): void {
   }
 }
 
+export function broadcastMeshPeers(userId: number): void {
+  const allForUser = memory.listPairedDevices(userId).map(sanitizeDeviceRecord);
+  const compactPeers = allForUser.map((d) => ({
+    id: d.id,
+    name: d.name,
+    platform: d.platform,
+    transport: d.transport,
+    status: d.status,
+    liveSocketConnected: d.liveSocketConnected,
+    capabilities: d.capabilities,
+    lanIp: typeof d.telemetry?.lanIp === 'string' ? d.telemetry.lanIp : null,
+    meshPort: typeof d.telemetry?.meshPort === 'number' ? d.telemetry.meshPort : 38472,
+    batteryPercent: d.telemetry?.batteryPercent ?? null,
+    lastSeenAt: d.lastSeenAt,
+  }));
+  for (const d of allForUser) {
+    const sock = agentSockets.get(d.id);
+    if (sock && sock.readyState === WebSocket.OPEN) {
+      sock.send(
+        JSON.stringify({
+          type: 'mesh_peers',
+          selfId: d.id,
+          peers: compactPeers.filter((p) => p.id !== d.id),
+          timestamp: new Date().toISOString(),
+        })
+      );
+    }
+  }
+}
+
+async function verifyGoogleAccessTokenEmail(accessToken: string): Promise<string | null> {
+  if (!accessToken || accessToken.length < 16 || accessToken.length > 4096) return null;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    const res = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+      headers: { Authorization: `Bearer ${accessToken}` },
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    if (!res.ok) return null;
+    const data = (await res.json()) as { email?: string; verified_email?: boolean };
+    if (data.email && data.verified_email !== false) {
+      return data.email.trim().toLowerCase();
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 export function isDestructiveDeviceCommand(commandType: string, payload: Record<string, unknown>): boolean {
   const ct = commandType.toLowerCase();
   if (ct === 'delete_file' || ct === 'uninstall_app' || ct === 'reboot' || ct === 'factory_reset') {
@@ -551,6 +602,7 @@ export function attachDeviceWebSocketServer(httpServer: HttpServer): void {
         const sanitized = sanitizeDeviceRecord(memory.getPairedDeviceById(existing.id)!);
         ws.send(JSON.stringify({ type: 'authenticated', deviceId: existing.id, name: existing.name }));
         broadcastOperatorEvent('device_update', sanitized);
+        broadcastMeshPeers(existing.user_id);
       }
     }
 
@@ -560,10 +612,76 @@ export function attachDeviceWebSocketServer(httpServer: HttpServer): void {
       }
     }, 30_000);
 
-    ws.on('message', (raw) => {
+    ws.on('message', async (raw) => {
       try {
         const msg = JSON.parse(raw.toString()) as Record<string, unknown>;
-        const type = String(msg.type || '');
+        let type = String(msg.type || '');
+
+        // Unified "hello" handshake used by Android Native App & Desktop Auto-Mesh
+        if (type === 'hello') {
+          if (typeof msg.token === 'string' && msg.token.trim()) {
+            type = 'auth';
+          } else if (typeof msg.pairingCode === 'string' && msg.pairingCode.trim()) {
+            type = 'pair';
+          } else if (typeof msg.googleAccessToken === 'string' && msg.googleAccessToken.trim()) {
+            type = 'account_pair';
+          }
+        }
+
+        // Automatic zero-code pairing via verified Google Account OAuth token
+        if (type === 'account_pair') {
+          const gToken = String(msg.googleAccessToken || '').trim();
+          const verifiedEmail = await verifyGoogleAccessTokenEmail(gToken);
+          if (!verifiedEmail) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Token Google inválido para auto-pareamento na malha.' }));
+            return;
+          }
+          const user = memory.findUserByIdentifier(verifiedEmail);
+          if (!user) {
+            ws.send(JSON.stringify({ type: 'error', message: `Conta ${verifiedEmail} ainda não registrada no Aegis Cloud.` }));
+            return;
+          }
+
+          const { rawToken, tokenHash } = generateDeviceToken();
+          const platform = (['android', 'ios', 'linux', 'windows', 'web'].includes(String(msg.platform))
+            ? String(msg.platform)
+            : 'linux') as memory.DevicePlatform;
+          const transport = (['termux_ws', 'android_app_ws', 'desktop_ws', 'ios_shortcut', 'pwa_browser'].includes(String(msg.transport))
+            ? String(msg.transport)
+            : platform === 'android'
+            ? 'android_app_ws'
+            : 'desktop_ws') as memory.DeviceTransport;
+          const serialOrUid = String(msg.serialOrUid || `${platform}_${crypto.randomBytes(4).toString('hex')}`).slice(0, 80);
+          const deterministicId = `mesh_${crypto.createHash('sha256').update(`${user.id}:${serialOrUid}`).digest('hex').slice(0, 12)}`;
+
+          const created = memory.upsertPairedDevice({
+            id: deterministicId,
+            userId: user.id,
+            name: String(msg.name || `Dispositivo ${platform.toUpperCase()}`),
+            platform,
+            transport,
+            serialOrUid,
+            tokenHash,
+            status: 'online',
+            capabilities: Array.isArray(msg.capabilities) ? msg.capabilities.map(String) : [],
+            telemetry: typeof msg.telemetry === 'object' && msg.telemetry ? (msg.telemetry as Record<string, unknown>) : {},
+          });
+
+          boundDeviceId = created.id;
+          agentSockets.set(created.id, ws);
+          ws.send(
+            JSON.stringify({
+              type: 'paired',
+              deviceId: created.id,
+              token: rawToken,
+              name: created.name,
+              autoPairedBy: 'google_account',
+            })
+          );
+          broadcastOperatorEvent('device_update', sanitizeDeviceRecord(created));
+          broadcastMeshPeers(user.id);
+          return;
+        }
 
         if (type === 'pair') {
           const code = String(msg.pairingCode || '').trim();
@@ -580,7 +698,7 @@ export function attachDeviceWebSocketServer(httpServer: HttpServer): void {
           const transport = (['termux_ws', 'android_app_ws', 'desktop_ws', 'ios_shortcut', 'pwa_browser'].includes(String(msg.transport))
             ? String(msg.transport)
             : platform === 'android'
-            ? 'termux_ws'
+            ? 'android_app_ws'
             : 'desktop_ws') as memory.DeviceTransport;
 
           const created = memory.upsertPairedDevice({
@@ -600,6 +718,7 @@ export function attachDeviceWebSocketServer(httpServer: HttpServer): void {
           agentSockets.set(created.id, ws);
           ws.send(JSON.stringify({ type: 'paired', deviceId: created.id, token: rawToken, name: created.name }));
           broadcastOperatorEvent('device_update', sanitizeDeviceRecord(created));
+          broadcastMeshPeers(codeRec.user_id);
           return;
         }
 
@@ -615,11 +734,72 @@ export function attachDeviceWebSocketServer(httpServer: HttpServer): void {
           const updated = memory.getPairedDeviceById(found.id)!;
           ws.send(JSON.stringify({ type: 'authenticated', deviceId: found.id, name: found.name }));
           broadcastOperatorEvent('device_update', sanitizeDeviceRecord(updated));
+          broadcastMeshPeers(found.user_id);
           return;
         }
 
         if (!boundDeviceId) {
-          ws.send(JSON.stringify({ type: 'error', message: 'Dispositivo não autenticado. Envie pair ou auth.' }));
+          ws.send(JSON.stringify({ type: 'error', message: 'Dispositivo não autenticado. Envie pair, auth ou account_pair.' }));
+          return;
+        }
+
+        if (type === 'get_peers') {
+          const me = memory.getPairedDeviceById(boundDeviceId);
+          if (me) broadcastMeshPeers(me.user_id);
+          return;
+        }
+
+        if (type === 'peer_command') {
+          const requestId = String(msg.requestId || `pr_${Date.now()}`);
+          const targetDeviceId = String(msg.targetDeviceId || '').trim();
+          const commandType = String(msg.commandType || '').trim();
+          const payload = typeof msg.payload === 'object' && msg.payload ? (msg.payload as Record<string, unknown>) : {};
+          const sender = memory.getPairedDeviceById(boundDeviceId);
+          const target = targetDeviceId ? memory.getPairedDeviceById(targetDeviceId) : null;
+
+          if (!sender || !target || sender.user_id !== target.user_id) {
+            ws.send(JSON.stringify({ type: 'peer_command_result', requestId, ok: false, error: 'Dispositivo destino não pertence à sua malha.' }));
+            return;
+          }
+          if (isDestructiveDeviceCommand(commandType, payload)) {
+            ws.send(JSON.stringify({ type: 'peer_command_result', requestId, ok: false, error: 'Comando destrutivo bloqueado via relay automático; execute diretamente no dispositivo ou aprove no painel.' }));
+            return;
+          }
+          const result = await dispatchDeviceCommand(target.id, commandType, payload, 20_000);
+          ws.send(
+            JSON.stringify({
+              type: 'peer_command_result',
+              requestId,
+              targetDeviceId: target.id,
+              ok: result.ok,
+              transport: result.transport,
+              output: result.output,
+              error: result.error,
+            })
+          );
+          return;
+        }
+
+        if (type === 'clipboard_broadcast') {
+          const text = String(msg.text || '').slice(0, 32_768);
+          const sender = memory.getPairedDeviceById(boundDeviceId);
+          if (!sender || !text) return;
+          const peers = memory.listPairedDevices(sender.user_id);
+          const frame = JSON.stringify({
+            type: 'clipboard_sync',
+            fromDeviceId: sender.id,
+            fromName: sender.name,
+            text,
+            timestamp: new Date().toISOString(),
+          });
+          for (const p of peers) {
+            if (p.id === sender.id) continue;
+            const sock = agentSockets.get(p.id);
+            if (sock && sock.readyState === WebSocket.OPEN) {
+              sock.send(frame);
+            }
+          }
+          broadcastOperatorEvent('clipboard_sync', { fromDeviceId: sender.id, fromName: sender.name, text });
           return;
         }
 
@@ -635,6 +815,7 @@ export function attachDeviceWebSocketServer(httpServer: HttpServer): void {
           });
           if (updated) {
             broadcastOperatorEvent('device_update', sanitizeDeviceRecord(updated));
+            broadcastMeshPeers(updated.user_id);
           }
           return;
         }
@@ -677,6 +858,7 @@ export function attachDeviceWebSocketServer(httpServer: HttpServer): void {
             });
             broadcastOperatorEvent('device_update', sanitizeDeviceRecord(child));
           }
+          if (bridge) broadcastMeshPeers(bridge.user_id);
           return;
         }
 
@@ -719,7 +901,10 @@ export function attachDeviceWebSocketServer(httpServer: HttpServer): void {
         memory.updateDeviceStatus(boundDeviceId, 'offline');
         memory.markBridgeChildrenOffline(boundDeviceId);
         const rec = memory.getPairedDeviceById(boundDeviceId);
-        if (rec) broadcastOperatorEvent('device_update', sanitizeDeviceRecord(rec));
+        if (rec) {
+          broadcastOperatorEvent('device_update', sanitizeDeviceRecord(rec));
+          broadcastMeshPeers(rec.user_id);
+        }
       }
     };
 

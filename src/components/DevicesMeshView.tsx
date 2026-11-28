@@ -45,11 +45,14 @@ type PairModeTab = 'android' | 'ios' | 'desktop';
 
 const TRANSPORT_LABELS: Record<string, string> = {
   adb_local: 'ADB Local (USB/Wi-Fi)',
+  adb_wifi: 'ADB Wireless (mDNS)',
   adb_desktop_relay: 'ADB via Desktop Relay',
+  lan_p2p: 'Wi-Fi / LAN P2P Direto',
+  cloud_mesh: 'Malha Nuvem (WebSocket)',
   termux_ws: 'Termux System Agent (Nuvem)',
-  android_app_ws: 'Android Companion App',
+  android_app_ws: 'Android Nativo (LAN + Nuvem)',
   ios_shortcut: 'iOS PWA + Atalhos',
-  desktop_ws: 'Desktop Agent (Nuvem)',
+  desktop_ws: 'Desktop Nativo (LAN + Nuvem)',
   pwa_browser: 'PWA Navegador',
 };
 
@@ -105,6 +108,7 @@ export const DevicesMeshView: React.FC<DevicesMeshViewProps> = ({
   const [nativeCatalog, setNativeCatalog] = useState<
     Array<{ os: 'linux' | 'windows' | 'android'; filename: string; downloadUrl: string; source?: string }>
   >([]);
+  const [incomingClipboard, setIncomingClipboard] = useState<{ fromName: string; text: string } | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
 
@@ -183,6 +187,11 @@ export const DevicesMeshView: React.FC<DevicesMeshViewProps> = ({
           const upd = msg.data as { deviceId?: string };
           if (upd.deviceId && upd.deviceId === selectedId) {
             void loadDeviceDetail(upd.deviceId);
+          }
+        } else if (msg.event === 'clipboard_sync' && msg.data) {
+          const clip = msg.data as { fromName?: string; text?: string };
+          if (clip.text) {
+            setIncomingClipboard({ fromName: clip.fromName || 'Dispositivo da Malha', text: clip.text });
           }
         }
       } catch {
@@ -431,13 +440,17 @@ export const DevicesMeshView: React.FC<DevicesMeshViewProps> = ({
     <div className="flex h-full flex-col overflow-hidden bg-[#070B12] text-slate-100">
       {/* Top Action Bar */}
       <div className="flex flex-wrap items-center justify-between gap-2.5 border-b border-white/10 bg-[#0B101A] px-4 sm:px-5 py-3 shrink-0">
-        <div className="flex items-center gap-3 min-w-0">
+        <div className="flex items-center gap-3 min-w-0 flex-wrap">
           <div className="text-xs font-mono text-slate-300">
             <span className="text-amber-300 font-semibold">{devices.length}</span>{' '}
             {devices.length === 1 ? 'dispositivo' : 'dispositivos'} ·{' '}
             <span className="text-emerald-400">
               {devices.filter((d) => d.status === 'online').length} online
             </span>
+          </div>
+          <div className="hidden md:flex items-center gap-1.5 text-[11px] font-mono text-slate-400 border-l border-white/10 pl-3">
+            <Wifi className="h-3.5 w-3.5 text-emerald-400" />
+            <span>Multiconexão Automática: LAN Wi-Fi P2P · Nuvem WS · Google · ADB</span>
           </div>
         </div>
 
@@ -469,12 +482,37 @@ export const DevicesMeshView: React.FC<DevicesMeshViewProps> = ({
             type="button"
             onClick={() => void loadDevices()}
             className="min-h-[40px] inline-flex items-center justify-center rounded-xl border border-white/10 bg-[#121826] px-2.5 text-slate-300 hover:border-amber-500/40 hover:text-amber-200 transition-colors cursor-pointer"
-            title="Atualizar lista e escanear ADB"
+            title="Atualizar malha de dispositivos e escanear ADB"
           >
             <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
           </button>
         </div>
       </div>
+
+      {incomingClipboard && (
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-emerald-500/25 bg-emerald-500/10 px-4 sm:px-5 py-2 text-xs">
+          <div className="min-w-0 flex-1 truncate font-mono text-emerald-200">
+            Área de transferência de <strong>{incomingClipboard.fromName}</strong>: {incomingClipboard.text}
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={() => copyText('mesh-clip', incomingClipboard.text)}
+              className="inline-flex items-center gap-1 rounded-lg border border-emerald-400/40 bg-[#081A14] px-2.5 py-1 text-[11px] font-medium text-emerald-200 hover:bg-emerald-500/20 cursor-pointer"
+            >
+              {copiedKey === 'mesh-clip' ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
+              <span>{copiedKey === 'mesh-clip' ? 'Copiado' : 'Copiar'}</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setIncomingClipboard(null)}
+              className="text-[11px] text-slate-400 hover:text-white cursor-pointer"
+            >
+              Fechar
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Main Content Area: Either Pairing Assistant OR Split Fleet/Inspector */}
       {showPairing ? (
@@ -818,12 +856,22 @@ export const DevicesMeshView: React.FC<DevicesMeshViewProps> = ({
                         {dev.status === 'online' ? 'ONLINE' : 'OFFLINE'}
                       </span>
                     </div>
-                    <div className="mt-2 flex items-center justify-between text-[10px] font-mono text-slate-400">
-                      <span>
-                        {typeof batt === 'number' ? `Bateria ${batt}%` : 'Telemetria ativa'}
+                    <div className="mt-2 flex items-center justify-between text-[10px] font-mono text-slate-400 gap-2">
+                      <span className="truncate">
+                        {typeof batt === 'number'
+                          ? `Bateria ${batt}%`
+                          : typeof dev.telemetry?.lanIp === 'string' && dev.telemetry.lanIp
+                          ? `LAN ${dev.telemetry.lanIp}`
+                          : 'Telemetria ativa'}
                       </span>
-                      <span>
-                        {dev.apps.length > 0 ? `${dev.apps.length} apps` : dev.files.length > 0 ? `${dev.files.length} itens` : ''}
+                      <span className="shrink-0 text-sky-300/80">
+                        {typeof dev.telemetry?.lanIp === 'string' && dev.telemetry.lanIp && typeof batt === 'number'
+                          ? `LAN ${dev.telemetry.lanIp}`
+                          : dev.apps.length > 0
+                          ? `${dev.apps.length} apps`
+                          : dev.files.length > 0
+                          ? `${dev.files.length} itens`
+                          : ''}
                       </span>
                     </div>
                   </button>

@@ -231,6 +231,7 @@ const PACKAGE_JSON_LINUX = `{
 `;
 
 const AEGIS_DAEMON_MJS = `import http from 'node:http';
+import dgram from 'node:dgram';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -1090,6 +1091,7 @@ const server = http.createServer(async (req, res) => {
     const cloud = loadCloudConnections();
     cloud.google = { token, email, updatedAt: new Date().toISOString() };
     saveCloudConnections(cloud);
+    try { startCloudRelay(); triggerLanDiscoveryProbe(); } catch {}
     let snap = null;
     try {
       snap = await runFullGoogleWorkspaceSync(token, email);
@@ -2452,15 +2454,608 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 200, { ok: true, message: 'Ponte com Aegis Cloud iniciada.' });
   }
 
+  // ===== Unified Multi-Transport Mesh Endpoints (Loopback Auth Required) =====
+  if (pathname === '/mesh/status' && req.method === 'GET') {
+    return sendJson(res, 200, getMeshStatusSnapshot());
+  }
+
+  if (pathname === '/mesh/scan' && req.method === 'POST') {
+    triggerLanDiscoveryProbe();
+    if (cloudRelaySocket && cloudRelaySocket.readyState === 1) {
+      try { cloudRelaySocket.send(JSON.stringify({ type: 'get_peers' })); } catch {}
+    } else {
+      startCloudRelay();
+    }
+    const adbList = await listAdbDevicesDesktop();
+    adbPeersCache = adbList;
+    await new Promise((r) => setTimeout(r, 650));
+    return sendJson(res, 200, { ok: true, ...getMeshStatusSnapshot() });
+  }
+
+  if (pathname === '/mesh/config' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      const cfg = loadMeshConfig();
+      if (typeof body.meshKey === 'string') {
+        cfg.meshKey = body.meshKey.trim().slice(0, 128);
+      }
+      if (typeof body.lanDiscovery === 'boolean') {
+        cfg.lanDiscovery = body.lanDiscovery;
+      }
+      saveMeshConfig(cfg);
+      if (typeof body.cloudUrl === 'string' && body.cloudUrl.trim()) {
+        saveLocalSettings({ cloudOrigin: body.cloudUrl.trim().replace(/\\/+$/, '') });
+        startCloudRelay();
+      }
+      triggerLanDiscoveryProbe();
+      return sendJson(res, 200, { ok: true, ...getMeshStatusSnapshot() });
+    } catch (e) {
+      return sendJson(res, 400, { ok: false, error: e.message });
+    }
+  }
+
+  if (pathname === '/mesh/exec' && req.method === 'POST') {
+    try {
+      const { peerId, commandType, payload = {}, preferredTransport } = await readBody(req);
+      if (!peerId || !commandType) {
+        return sendJson(res, 400, { ok: false, error: 'peerId e commandType são obrigatórios.' });
+      }
+      const out = await execMeshPeerCommand(String(peerId), String(commandType), payload, preferredTransport ? String(preferredTransport) : '');
+      return sendJson(res, out.ok ? 200 : 400, out);
+    } catch (e) {
+      return sendJson(res, 400, { ok: false, error: e.message });
+    }
+  }
+
+  if (pathname === '/mesh/clipboard' && req.method === 'POST') {
+    try {
+      const { text } = await readBody(req);
+      const clean = String(text || '').slice(0, 32768);
+      if (!clean) return sendJson(res, 400, { ok: false, error: 'Texto vazio.' });
+      const delivered = await broadcastMeshClipboard(clean);
+      return sendJson(res, 200, { ok: true, delivered, ...getMeshStatusSnapshot() });
+    } catch (e) {
+      return sendJson(res, 400, { ok: false, error: e.message });
+    }
+  }
+
   res.writeHead(404);
   res.end('Not Found');
 });
 
 // ==========================================
-// DESKTOP ADB BRIDGE & AEGIS CLOUD RELAY
+// DESKTOP MULTI-TRANSPORT AUTO-MESH ENGINE
+// (LAN UDP Discovery + HMAC LAN P2P + Cloud WS Mesh + ADB USB/Wi-Fi)
 // ==========================================
 const CLOUD_BRIDGE_FILE = path.join(DATA_DIR, 'cloud_bridge.json');
+const MESH_CONFIG_FILE = path.join(DATA_DIR, 'mesh_config.json');
+const LAN_DISCOVERY_PORT = Number(process.env.AEGIS_MESH_UDP_PORT || 38471);
+const LAN_MESH_PORT = Number(process.env.AEGIS_MESH_TCP_PORT || 38472);
 const ADB_SERIAL_RE = /^[a-zA-Z0-9._:-]{1,64}$/;
+
+const lanPeers = new Map();
+const cloudPeers = new Map();
+let adbPeersCache = [];
+let lanDiscoverySocket = null;
+let lanMeshServer = null;
+let lanDiscoveryActive = false;
+let lanMeshServerActive = false;
+let cloudRelayState = 'idle';
+let cloudSelfId = '';
+let recentClipboard = null;
+const pendingPeerCommands = new Map();
+
+function loadMeshConfig() {
+  try {
+    if (fs.existsSync(MESH_CONFIG_FILE)) {
+      const parsed = JSON.parse(fs.readFileSync(MESH_CONFIG_FILE, 'utf-8'));
+      if (parsed && parsed.deviceId) return parsed;
+    }
+  } catch {}
+  const fresh = {
+    deviceId: 'aegis_' + (IS_WIN ? 'win' : 'linux') + '_' + crypto.randomBytes(6).toString('hex'),
+    meshKey: process.env.AEGIS_MESH_KEY || '',
+    lanDiscovery: true,
+  };
+  try {
+    fs.writeFileSync(MESH_CONFIG_FILE, JSON.stringify(fresh, null, 2), { mode: 0o600 });
+  } catch {}
+  return fresh;
+}
+
+function saveMeshConfig(cfg) {
+  fs.writeFileSync(MESH_CONFIG_FILE, JSON.stringify(cfg, null, 2), { mode: 0o600 });
+}
+
+const MESH_CFG_INIT = loadMeshConfig();
+
+function getLanIpv4Addresses() {
+  const ips = [];
+  try {
+    const nets = os.networkInterfaces();
+    for (const ifaces of Object.values(nets)) {
+      for (const iface of ifaces || []) {
+        if (iface && iface.family === 'IPv4' && !iface.internal && iface.address) {
+          ips.push(iface.address);
+        }
+      }
+    }
+  } catch {}
+  return ips;
+}
+
+function getEffectiveMeshSecret() {
+  const cfg = loadMeshConfig();
+  if (cfg.meshKey && cfg.meshKey.trim()) {
+    return { secret: cfg.meshKey.trim(), source: 'custom_key' };
+  }
+  const cloud = loadCloudConnections();
+  const email = cloud?.google?.email ? String(cloud.google.email).trim().toLowerCase() : '';
+  if (email) {
+    const derived = crypto.createHash('sha256').update('aegis-google-mesh:' + email).digest('hex');
+    return { secret: derived, source: 'google_account' };
+  }
+  return { secret: '', source: 'none' };
+}
+
+function computeMeshHmac(secret, ts, bodyStr) {
+  return crypto.createHmac('sha256', secret).update(String(ts) + '.' + String(bodyStr)).digest('hex');
+}
+
+function verifyMeshHmac(secret, tsHeader, sigHeader, bodyStr) {
+  if (!secret || !tsHeader || !sigHeader) return false;
+  const ts = Number(tsHeader);
+  if (!Number.isFinite(ts) || Math.abs(Date.now() - ts) > 60_000) return false;
+  const expected = computeMeshHmac(secret, tsHeader, bodyStr);
+  try {
+    const a = Buffer.from(expected, 'hex');
+    const b = Buffer.from(String(sigHeader).trim(), 'hex');
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
+}
+
+function isDestructiveMeshShell(cmd) {
+  const s = String(cmd || '').toLowerCase();
+  return /(rm\\s+-rf|mkfs\\.|dd\\s+if=|shutdown|reboot|poweroff|format\\s+[a-z]:|del\\s+\\/s|remove-item.*-recurse|chmod\\s+-r\\s+777\\s+\\/)/.test(s);
+}
+
+function buildLanBeaconPacket(kind = 'aegis-mesh-v1') {
+  const cfg = loadMeshConfig();
+  const lanIps = getLanIpv4Addresses();
+  const sec = getEffectiveMeshSecret();
+  return JSON.stringify({
+    proto: kind,
+    deviceId: cloudSelfId || cfg.deviceId,
+    name: os.hostname() + (IS_WIN ? ' (Windows)' : ' (Linux)'),
+    platform: IS_WIN ? 'windows' : 'linux',
+    lanIp: lanIps[0] || '',
+    lanIps,
+    meshPort: LAN_MESH_PORT,
+    authMode: sec.source,
+    capabilities: ['ping', 'telemetry', 'list_files', 'read_file', 'shell', 'clipboard_sync', 'adb_bridge'],
+    ts: Date.now(),
+  });
+}
+
+function sendLanBroadcast(packetStr) {
+  if (!lanDiscoverySocket) return;
+  const buf = Buffer.from(packetStr, 'utf-8');
+  const targets = new Set(['255.255.255.255']);
+  for (const ip of getLanIpv4Addresses()) {
+    const parts = ip.split('.');
+    if (parts.length === 4) targets.add(parts[0] + '.' + parts[1] + '.' + parts[2] + '.255');
+  }
+  for (const addr of targets) {
+    try {
+      lanDiscoverySocket.send(buf, 0, buf.length, LAN_DISCOVERY_PORT, addr);
+    } catch {}
+  }
+}
+
+function triggerLanDiscoveryProbe() {
+  if (!lanDiscoverySocket) return;
+  sendLanBroadcast(buildLanBeaconPacket('aegis-mesh-probe'));
+  sendLanBroadcast(buildLanBeaconPacket('aegis-mesh-v1'));
+}
+
+function startLanDiscovery() {
+  const cfg = loadMeshConfig();
+  if (cfg.lanDiscovery === false) return;
+  try {
+    const sock = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+    lanDiscoverySocket = sock;
+    sock.on('error', (err) => {
+      lanDiscoveryActive = false;
+      console.warn('[Aegis LAN Mesh] UDP discovery aviso:', err.message);
+    });
+    sock.on('message', (msg, rinfo) => {
+      try {
+        const data = JSON.parse(msg.toString('utf-8'));
+        if (!data || (data.proto !== 'aegis-mesh-v1' && data.proto !== 'aegis-mesh-probe')) return;
+        const myCfg = loadMeshConfig();
+        const myId = cloudSelfId || myCfg.deviceId;
+        if (!data.deviceId || data.deviceId === myId || data.deviceId === myCfg.deviceId) return;
+        const peerIp = rinfo.address || data.lanIp || '';
+        if (!peerIp || peerIp === '127.0.0.1') return;
+        lanPeers.set(data.deviceId, {
+          id: data.deviceId,
+          name: String(data.name || data.deviceId).slice(0, 80),
+          platform: String(data.platform || 'unknown'),
+          lanIp: peerIp,
+          meshPort: Number(data.meshPort || LAN_MESH_PORT),
+          authMode: String(data.authMode || 'none'),
+          capabilities: Array.isArray(data.capabilities) ? data.capabilities : [],
+          lastSeen: Date.now(),
+        });
+        if (data.proto === 'aegis-mesh-probe') {
+          const replyBuf = Buffer.from(buildLanBeaconPacket('aegis-mesh-v1'), 'utf-8');
+          sock.send(replyBuf, 0, replyBuf.length, rinfo.port || LAN_DISCOVERY_PORT, peerIp);
+        }
+      } catch {}
+    });
+    sock.bind(LAN_DISCOVERY_PORT, () => {
+      try { sock.setBroadcast(true); } catch {}
+      lanDiscoveryActive = true;
+      console.log('[Aegis LAN Mesh] Descoberta automática Wi-Fi/LAN ativa em UDP :' + LAN_DISCOVERY_PORT);
+      triggerLanDiscoveryProbe();
+      setInterval(() => {
+        const now = Date.now();
+        for (const [k, v] of lanPeers.entries()) {
+          if (now - v.lastSeen > 35_000) lanPeers.delete(k);
+        }
+        sendLanBroadcast(buildLanBeaconPacket('aegis-mesh-v1'));
+      }, 6000);
+    });
+  } catch (e) {
+    console.warn('[Aegis LAN Mesh] Falha ao iniciar UDP discovery:', e.message);
+  }
+}
+
+async function handleLocalMeshCommand(commandType, payload = {}, fromName = 'peer') {
+  if (commandType === 'ping') {
+    return {
+      ok: true,
+      output: {
+        pong: true,
+        hostname: os.hostname(),
+        platform: IS_WIN ? 'windows' : 'linux',
+        lanIps: getLanIpv4Addresses(),
+        ts: Date.now(),
+      },
+    };
+  }
+  if (commandType === 'telemetry') {
+    return {
+      ok: true,
+      output: {
+        hostname: os.hostname(),
+        platform: os.platform(),
+        lanIps: getLanIpv4Addresses(),
+        totalMemMb: Math.round(os.totalmem() / 1048576),
+        freeMemMb: Math.round(os.freemem() / 1048576),
+        uptimeSeconds: Math.round(os.uptime()),
+      },
+    };
+  }
+  if (commandType === 'clipboard_sync') {
+    const txt = String(payload.text || '').slice(0, 32768);
+    recentClipboard = { fromName, text: txt, receivedAt: new Date().toISOString(), transport: 'lan_p2p' };
+    return { ok: true, output: { received: true, length: txt.length } };
+  }
+  if (commandType === 'list_files') {
+    const dir = path.resolve(HOME, String(payload.path || '.'));
+    const entries = fs.readdirSync(dir, { withFileTypes: true }).slice(0, 120).map((e) => ({
+      name: e.name,
+      path: path.join(dir, e.name),
+      type: e.isDirectory() ? 'directory' : 'file',
+    }));
+    return { ok: true, output: { path: dir, entries } };
+  }
+  if (commandType === 'read_file') {
+    const fp = path.resolve(HOME, String(payload.path || ''));
+    return { ok: true, output: { path: fp, content: fs.readFileSync(fp, 'utf-8').slice(0, 120000) } };
+  }
+  if (commandType === 'shell') {
+    const cmd = String(payload.command || '').trim();
+    if (!cmd) return { ok: false, error: 'Comando vazio.' };
+    if (isDestructiveMeshShell(cmd)) {
+      return { ok: false, error: 'Comando destrutivo bloqueado na execução automática de malha.' };
+    }
+    const out = await execNative(cmd, HOME);
+    return { ok: true, output: out };
+  }
+  return { ok: false, error: 'Comando de malha não suportado no Desktop: ' + commandType };
+}
+
+function startLanMeshServer() {
+  try {
+    const mServer = http.createServer(async (req, res) => {
+      const u = new URL(req.url || '/', 'http://127.0.0.1:' + LAN_MESH_PORT);
+      if (u.pathname === '/mesh/info' && req.method === 'GET') {
+        const cfg = loadMeshConfig();
+        const sec = getEffectiveMeshSecret();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({
+          deviceId: cloudSelfId || cfg.deviceId,
+          name: os.hostname() + (IS_WIN ? ' (Windows)' : ' (Linux)'),
+          platform: IS_WIN ? 'windows' : 'linux',
+          lanIps: getLanIpv4Addresses(),
+          meshPort: LAN_MESH_PORT,
+          authRequired: true,
+          authMode: sec.source,
+        }));
+      }
+      if (u.pathname === '/mesh/exec' && req.method === 'POST') {
+        let rawBody = '';
+        for await (const chunk of req) {
+          rawBody += chunk;
+          if (rawBody.length > 512 * 1024) {
+            res.writeHead(413, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ ok: false, error: 'Payload excede limite.' }));
+          }
+        }
+        const sec = getEffectiveMeshSecret();
+        if (!sec.secret) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({
+            ok: false,
+            error: 'Defina uma Chave de Malha LAN compartilhada ou conecte a mesma conta Google em ambos os dispositivos.',
+          }));
+        }
+        const tsHdr = String(req.headers['x-aegis-mesh-ts'] || '');
+        const sigHdr = String(req.headers['x-aegis-mesh-sig'] || '');
+        if (!verifyMeshHmac(sec.secret, tsHdr, sigHdr, rawBody)) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ ok: false, error: 'Assinatura HMAC da Malha LAN inválida ou expirada.' }));
+        }
+        try {
+          const parsed = JSON.parse(rawBody || '{}');
+          const out = await handleLocalMeshCommand(String(parsed.commandType || ''), parsed.payload || {}, String(parsed.fromName || 'LAN Peer'));
+          res.writeHead(out.ok ? 200 : 400, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify(out));
+        } catch (err) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ ok: false, error: err.message }));
+        }
+      }
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'Not Found' }));
+    });
+    lanMeshServer = mServer;
+    mServer.on('error', (err) => {
+      lanMeshServerActive = false;
+      console.warn('[Aegis LAN P2P] Servidor TCP :' + LAN_MESH_PORT + ' aviso:', err.message);
+    });
+    mServer.listen(LAN_MESH_PORT, '0.0.0.0', () => {
+      lanMeshServerActive = true;
+      console.log('[Aegis LAN P2P] Canal direto autenticado (HMAC-SHA256) ativo em 0.0.0.0:' + LAN_MESH_PORT);
+    });
+  } catch (e) {
+    console.warn('[Aegis LAN P2P] Erro ao iniciar servidor P2P:', e.message);
+  }
+}
+
+async function sendLanP2pCommand(lanIp, meshPort, commandType, payload = {}) {
+  const sec = getEffectiveMeshSecret();
+  if (!sec.secret) {
+    return {
+      ok: false,
+      error: 'Configure uma Chave de Malha LAN compartilhada (ou conecte o Google) para executar via Wi-Fi/LAN direto.',
+    };
+  }
+  const bodyStr = JSON.stringify({
+    fromId: cloudSelfId || loadMeshConfig().deviceId,
+    fromName: os.hostname(),
+    commandType,
+    payload,
+  });
+  const ts = String(Date.now());
+  const sig = computeMeshHmac(sec.secret, ts, bodyStr);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    const resp = await fetch('http://' + lanIp + ':' + (meshPort || LAN_MESH_PORT) + '/mesh/exec', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Aegis-Mesh-Ts': ts,
+        'X-Aegis-Mesh-Sig': sig,
+      },
+      body: bodyStr,
+      signal: controller.signal,
+    });
+    const data = await resp.json().catch(() => ({ ok: false, error: 'Resposta inválida do peer LAN.' }));
+    return { ...data, transportUsed: 'lan_p2p' };
+  } catch (err) {
+    return { ok: false, error: 'Falha LAN P2P (' + lanIp + '): ' + err.message };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function sendCloudPeerCommand(targetDeviceId, commandType, payload = {}) {
+  return new Promise((resolve) => {
+    if (!cloudRelaySocket || cloudRelaySocket.readyState !== 1) {
+      return resolve({ ok: false, error: 'Nuvem WebSocket não conectada.' });
+    }
+    const requestId = 'p2p_' + crypto.randomBytes(6).toString('hex');
+    const timer = setTimeout(() => {
+      pendingPeerCommands.delete(requestId);
+      resolve({ ok: false, error: 'Tempo esgotado no relay Nuvem WebSocket.' });
+    }, 18000);
+    pendingPeerCommands.set(requestId, (result) => {
+      clearTimeout(timer);
+      resolve({ ...result, transportUsed: 'cloud_ws' });
+    });
+    try {
+      cloudRelaySocket.send(JSON.stringify({
+        type: 'peer_command',
+        requestId,
+        targetDeviceId,
+        commandType,
+        payload,
+      }));
+    } catch (e) {
+      clearTimeout(timer);
+      pendingPeerCommands.delete(requestId);
+      resolve({ ok: false, error: e.message });
+    }
+  });
+}
+
+function getUnifiedMeshPeers() {
+  const map = new Map();
+
+  for (const p of lanPeers.values()) {
+    map.set(p.id, {
+      id: p.id,
+      name: p.name,
+      platform: p.platform,
+      status: 'online',
+      lanIp: p.lanIp,
+      meshPort: p.meshPort,
+      adbSerial: '',
+      transports: ['lan_p2p'],
+      capabilities: p.capabilities || [],
+      lastSeen: p.lastSeen,
+    });
+  }
+
+  for (const p of cloudPeers.values()) {
+    const existing = map.get(p.id);
+    if (existing) {
+      if (!existing.transports.includes('cloud_ws')) existing.transports.push('cloud_ws');
+      if (!existing.lanIp && p.lanIp) existing.lanIp = p.lanIp;
+      if (p.status === 'online') existing.status = 'online';
+    } else {
+      const transports = [];
+      if (p.lanIp && p.meshPort) transports.push('lan_p2p');
+      if (p.status === 'online') transports.push('cloud_ws');
+      map.set(p.id, {
+        id: p.id,
+        name: p.name,
+        platform: p.platform,
+        status: p.status || 'offline',
+        lanIp: p.lanIp || '',
+        meshPort: p.meshPort || LAN_MESH_PORT,
+        adbSerial: '',
+        transports,
+        capabilities: p.capabilities || [],
+        lastSeen: p.lastSeenAt ? new Date(p.lastSeenAt).getTime() : Date.now(),
+      });
+    }
+  }
+
+  for (const a of adbPeersCache) {
+    const adbId = 'adb:' + a.serial;
+    const isWifi = a.serial.includes(':');
+    const existingByModel = Array.from(map.values()).find(
+      (x) => x.platform === 'android' && a.model && x.name.toLowerCase().includes(a.model.toLowerCase())
+    );
+    if (existingByModel) {
+      existingByModel.adbSerial = a.serial;
+      if (!existingByModel.transports.includes(isWifi ? 'adb_wifi' : 'adb_usb')) {
+        existingByModel.transports.push(isWifi ? 'adb_wifi' : 'adb_usb');
+      }
+    } else {
+      map.set(adbId, {
+        id: adbId,
+        name: a.model || a.serial,
+        platform: 'android',
+        status: 'online',
+        lanIp: isWifi ? a.serial.split(':')[0] : '',
+        meshPort: LAN_MESH_PORT,
+        adbSerial: a.serial,
+        transports: [isWifi ? 'adb_wifi' : 'adb_usb'],
+        capabilities: ['shell', 'list_files', 'read_file', 'open_app', 'input_tap', 'input_keyevent'],
+        lastSeen: Date.now(),
+      });
+    }
+  }
+
+  return Array.from(map.values());
+}
+
+async function execMeshPeerCommand(peerId, commandType, payload = {}, preferredTransport = '') {
+  const peers = getUnifiedMeshPeers();
+  const peer = peers.find((p) => p.id === peerId || (p.adbSerial && ('adb:' + p.adbSerial) === peerId));
+  if (!peer) {
+    return { ok: false, error: 'Dispositivo não localizado na malha atual. Clique em Escanear Malha.' };
+  }
+
+  const order = [];
+  if (preferredTransport) order.push(preferredTransport);
+  if (peer.lanIp && !order.includes('lan_p2p')) order.push('lan_p2p');
+  if (peer.transports.includes('cloud_ws') && !order.includes('cloud_ws')) order.push('cloud_ws');
+  if (peer.adbSerial && !order.includes('adb')) order.push('adb');
+
+  const errors = [];
+  for (const tr of order) {
+    if (tr === 'lan_p2p' && peer.lanIp) {
+      const r = await sendLanP2pCommand(peer.lanIp, peer.meshPort || LAN_MESH_PORT, commandType, payload);
+      if (r.ok) return { ...r, peerId: peer.id, peerName: peer.name, transportUsed: 'lan_p2p' };
+      errors.push('LAN P2P: ' + (r.error || 'falhou'));
+    } else if (tr === 'cloud_ws' && !peer.id.startsWith('adb:')) {
+      const r = await sendCloudPeerCommand(peer.id, commandType, payload);
+      if (r.ok) return { ...r, peerId: peer.id, peerName: peer.name, transportUsed: 'cloud_ws' };
+      errors.push('Nuvem WS: ' + (r.error || 'falhou'));
+    } else if ((tr === 'adb' || tr === 'adb_usb' || tr === 'adb_wifi') && peer.adbSerial) {
+      const r = await execAdbOnDesktop(peer.adbSerial, commandType === 'ping' ? 'shell' : commandType, commandType === 'ping' ? { command: 'echo pong && getprop ro.product.model' } : payload);
+      if (r.ok) return { ...r, peerId: peer.id, peerName: peer.name, transportUsed: peer.adbSerial.includes(':') ? 'adb_wifi' : 'adb_usb' };
+      errors.push('ADB: ' + (r.error || 'falhou'));
+    }
+  }
+
+  return { ok: false, peerId: peer.id, error: 'Todos os transportes falharam (' + errors.join(' | ') + ')' };
+}
+
+async function broadcastMeshClipboard(text) {
+  let delivered = 0;
+  recentClipboard = { fromName: os.hostname() + ' (local)', text, receivedAt: new Date().toISOString(), transport: 'local' };
+  const peers = getUnifiedMeshPeers();
+  for (const p of peers) {
+    if (p.lanIp) {
+      const r = await sendLanP2pCommand(p.lanIp, p.meshPort || LAN_MESH_PORT, 'clipboard_sync', { text });
+      if (r.ok) delivered++;
+    }
+  }
+  if (cloudRelaySocket && cloudRelaySocket.readyState === 1) {
+    try {
+      cloudRelaySocket.send(JSON.stringify({ type: 'clipboard_broadcast', text }));
+      delivered++;
+    } catch {}
+  }
+  return delivered;
+}
+
+function getMeshStatusSnapshot() {
+  const cfg = loadMeshConfig();
+  const sec = getEffectiveMeshSecret();
+  const cloud = loadCloudConnections();
+  const settings = loadLocalSettings();
+  return {
+    selfId: cloudSelfId || cfg.deviceId,
+    name: os.hostname() + (IS_WIN ? ' (Windows Desktop)' : ' (Linux Desktop)'),
+    platform: IS_WIN ? 'windows' : 'linux',
+    lanIps: getLanIpv4Addresses(),
+    lanDiscoveryPort: LAN_DISCOVERY_PORT,
+    lanMeshPort: LAN_MESH_PORT,
+    meshKeyConfigured: Boolean(cfg.meshKey && cfg.meshKey.trim()),
+    meshSecretSource: sec.source,
+    googleEmail: cloud?.google?.email || null,
+    cloudOrigin: process.env.AEGIS_CLOUD_URL || settings.cloudOrigin || '',
+    transports: {
+      lanDiscovery: lanDiscoveryActive,
+      lanP2p: lanMeshServerActive,
+      cloudWs: cloudRelayState,
+      adbCount: adbPeersCache.length,
+    },
+    peers: getUnifiedMeshPeers(),
+    recentClipboard,
+  };
+}
 
 async function runAdbDesktop(args, timeout = 10000) {
   const { execFile } = await import('node:child_process');
@@ -2472,7 +3067,23 @@ async function runAdbDesktop(args, timeout = 10000) {
   });
 }
 
+async function autoConnectWirelessAdb() {
+  try {
+    const mdns = await runAdbDesktop(['mdns', 'services'], 2500);
+    if (!mdns.ok || !mdns.stdout) return;
+    const lines = mdns.stdout.split('\\n');
+    for (const line of lines) {
+      if (!line.includes('_adb-tls-connect._tcp')) continue;
+      const m = line.match(/(\\d{1,3}(?:\\.\\d{1,3}){3}:\\d{2,5})/);
+      if (m && m[1]) {
+        await runAdbDesktop(['connect', m[1]], 2500);
+      }
+    }
+  } catch {}
+}
+
 async function listAdbDevicesDesktop() {
+  await autoConnectWirelessAdb();
   const res = await runAdbDesktop(['devices', '-l'], 3500);
   if (!res.ok) return [];
   const lines = res.stdout.split('\\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('List of') && !l.startsWith('* daemon'));
@@ -2500,6 +3111,7 @@ async function listAdbDevicesDesktop() {
       storage: { raw: df.stdout.trim() },
     });
   }
+  adbPeersCache = devices;
   return devices;
 }
 
@@ -2533,8 +3145,8 @@ async function execAdbOnDesktop(serial, commandType, payload = {}) {
     const r = await runAdbDesktop(['-s', serial, 'shell', 'input', 'text', txt], 6000);
     return { ok: r.ok, output: { typed: payload.text }, error: r.ok ? undefined : r.stderr };
   }
-  if (commandType === 'input_keyevent') {
-    const key = String(payload.key || 'KEYCODE_HOME').replace(/[^A-Z0-9_]/gi, '');
+  if (commandType === 'input_keyevent' || commandType === 'keyevent') {
+    const key = String(payload.key || payload.keycode || 'KEYCODE_HOME').replace(/[^A-Z0-9_]/gi, '');
     const r = await runAdbDesktop(['-s', serial, 'shell', 'input', 'keyevent', key], 6000);
     return { ok: r.ok, output: { keyevent: key }, error: r.ok ? undefined : r.stderr };
   }
@@ -2551,22 +3163,46 @@ async function execAdbOnDesktop(serial, commandType, payload = {}) {
 }
 
 let cloudRelaySocket = null;
+let cloudReconnectTimer = null;
 function startCloudRelay() {
+  if (cloudReconnectTimer) { clearTimeout(cloudReconnectTimer); cloudReconnectTimer = null; }
   let cfg = null;
   try { cfg = JSON.parse(fs.readFileSync(CLOUD_BRIDGE_FILE, 'utf-8')); } catch {}
-  const cloudUrl = process.env.AEGIS_CLOUD_URL || cfg?.cloudUrl || '';
+  const localSettings = loadLocalSettings();
+  const cloudConns = loadCloudConnections();
+  const cloudUrl = process.env.AEGIS_CLOUD_URL || cfg?.cloudUrl || localSettings.cloudOrigin || '';
   const pairCode = process.env.AEGIS_PAIR_CODE || cfg?.pairingCode || '';
   const token = process.env.AEGIS_DEVICE_TOKEN || cfg?.token || '';
-  if (!cloudUrl || !globalThis.WebSocket) return;
+  const googleToken = cloudConns?.google?.token || '';
+  if (!cloudUrl || !globalThis.WebSocket) {
+    cloudRelayState = 'unconfigured';
+    return;
+  }
+  if (!token && !pairCode && !googleToken) {
+    cloudRelayState = 'awaiting_auth';
+    return;
+  }
   const wsBase = cloudUrl.replace(/^http:\\/\\//i, 'ws://').replace(/^https:\\/\\//i, 'wss://').replace(/\\/$/, '');
   const fullWs = wsBase + '/api/devices/ws' + (token ? '?token=' + encodeURIComponent(token) : '');
   try { cloudRelaySocket?.close(); } catch {}
+  cloudRelayState = 'connecting';
   const ws = new globalThis.WebSocket(fullWs);
   cloudRelaySocket = ws;
   let adbTimer = null;
 
   ws.addEventListener('open', async () => {
-    console.log('[Aegis Cloud Relay] Conectado à nuvem:', wsBase);
+    cloudRelayState = 'online';
+    console.log('[Aegis Cloud Mesh] Conectado à nuvem:', wsBase);
+    const lanIps = getLanIpv4Addresses();
+    const baseTelemetry = {
+      hostname: os.hostname(),
+      platform: os.platform(),
+      lanIp: lanIps[0] || '',
+      lanIps,
+      meshPort: LAN_MESH_PORT,
+      totalMemMb: Math.round(os.totalmem() / 1048576),
+      freeMemMb: Math.round(os.freemem() / 1048576),
+    };
     if (!token && pairCode) {
       ws.send(JSON.stringify({
         type: 'pair',
@@ -2574,18 +3210,40 @@ function startCloudRelay() {
         name: os.hostname() + (IS_WIN ? ' (Windows Desktop)' : ' (Linux Desktop)'),
         platform: IS_WIN ? 'windows' : 'linux',
         transport: 'desktop_ws',
-        capabilities: ['shell', 'list_files', 'read_file', 'adb_bridge'],
-        telemetry: { hostname: os.hostname(), platform: os.platform(), totalMemMb: Math.round(os.totalmem() / 1048576), freeMemMb: Math.round(os.freemem() / 1048576) },
+        capabilities: ['ping', 'shell', 'list_files', 'read_file', 'adb_bridge', 'lan_p2p', 'clipboard_sync'],
+        telemetry: baseTelemetry,
+      }));
+    } else if (!token && googleToken) {
+      ws.send(JSON.stringify({
+        type: 'account_pair',
+        googleAccessToken: googleToken,
+        serialOrUid: loadMeshConfig().deviceId,
+        name: os.hostname() + (IS_WIN ? ' (Windows Desktop)' : ' (Linux Desktop)'),
+        platform: IS_WIN ? 'windows' : 'linux',
+        transport: 'desktop_ws',
+        capabilities: ['ping', 'shell', 'list_files', 'read_file', 'adb_bridge', 'lan_p2p', 'clipboard_sync'],
+        telemetry: baseTelemetry,
       }));
     } else {
+      ws.send(JSON.stringify({ type: 'telemetry', telemetry: baseTelemetry }));
+      ws.send(JSON.stringify({ type: 'get_peers' }));
       const adbList = await listAdbDevicesDesktop();
       ws.send(JSON.stringify({ type: 'adb_devices', devices: adbList }));
     }
     adbTimer = setInterval(async () => {
       if (ws.readyState === 1) {
+        const curIps = getLanIpv4Addresses();
         ws.send(JSON.stringify({
           type: 'telemetry',
-          telemetry: { hostname: os.hostname(), totalMemMb: Math.round(os.totalmem() / 1048576), freeMemMb: Math.round(os.freemem() / 1048576), uptimeSeconds: Math.round(os.uptime()) },
+          telemetry: {
+            hostname: os.hostname(),
+            lanIp: curIps[0] || '',
+            lanIps: curIps,
+            meshPort: LAN_MESH_PORT,
+            totalMemMb: Math.round(os.totalmem() / 1048576),
+            freeMemMb: Math.round(os.freemem() / 1048576),
+            uptimeSeconds: Math.round(os.uptime()),
+          },
         }));
         const adbList = await listAdbDevicesDesktop();
         ws.send(JSON.stringify({ type: 'adb_devices', devices: adbList }));
@@ -2596,28 +3254,42 @@ function startCloudRelay() {
   ws.addEventListener('message', async (ev) => {
     try {
       const msg = JSON.parse(String(ev.data));
-      if (msg.type === 'paired' && msg.token) {
-        fs.writeFileSync(CLOUD_BRIDGE_FILE, JSON.stringify({ cloudUrl, token: msg.token, deviceId: msg.deviceId }, null, 2), { mode: 0o600 });
+      if ((msg.type === 'paired' || msg.type === 'authenticated') && (msg.token || msg.deviceId)) {
+        if (msg.deviceId) cloudSelfId = String(msg.deviceId);
+        if (msg.token) {
+          fs.writeFileSync(CLOUD_BRIDGE_FILE, JSON.stringify({ cloudUrl, token: msg.token, deviceId: msg.deviceId }, null, 2), { mode: 0o600 });
+        }
+        ws.send(JSON.stringify({ type: 'get_peers' }));
         const adbList = await listAdbDevicesDesktop();
         ws.send(JSON.stringify({ type: 'adb_devices', devices: adbList }));
+      } else if (msg.type === 'mesh_peers' && Array.isArray(msg.peers)) {
+        if (msg.selfId) cloudSelfId = String(msg.selfId);
+        cloudPeers.clear();
+        for (const p of msg.peers) {
+          if (p && p.id && p.id !== cloudSelfId) {
+            cloudPeers.set(p.id, p);
+          }
+        }
+      } else if (msg.type === 'peer_command_result' && msg.requestId) {
+        const cb = pendingPeerCommands.get(msg.requestId);
+        if (cb) {
+          pendingPeerCommands.delete(msg.requestId);
+          cb({ ok: Boolean(msg.ok), output: msg.output, error: msg.error });
+        }
+      } else if (msg.type === 'clipboard_sync' && msg.text) {
+        recentClipboard = {
+          fromName: String(msg.fromName || 'Outro Dispositivo'),
+          text: String(msg.text).slice(0, 32768),
+          receivedAt: new Date().toISOString(),
+          transport: 'cloud_ws',
+        };
       } else if (msg.type === 'adb_exec') {
         const resAdb = await execAdbOnDesktop(msg.serial, msg.commandType, msg.payload || {});
         ws.send(JSON.stringify({ type: 'command_result', commandId: msg.commandId, ok: resAdb.ok, output: resAdb.output, error: resAdb.error }));
-      } else if (msg.type === 'exec_command') {
+      } else if (msg.type === 'exec_command' || msg.type === 'command') {
         try {
-          if (msg.commandType === 'shell') {
-            const out = await execNative(String(msg.payload?.command || ''), HOME);
-            ws.send(JSON.stringify({ type: 'command_result', commandId: msg.commandId, ok: true, output: out }));
-          } else if (msg.commandType === 'list_files') {
-            const dir = path.resolve(HOME, String(msg.payload?.path || '.'));
-            const entries = fs.readdirSync(dir, { withFileTypes: true }).slice(0, 120).map((e) => ({ name: e.name, path: path.join(dir, e.name), type: e.isDirectory() ? 'directory' : 'file' }));
-            ws.send(JSON.stringify({ type: 'command_result', commandId: msg.commandId, ok: true, output: { path: dir, entries } }));
-          } else if (msg.commandType === 'read_file') {
-            const fp = path.resolve(HOME, String(msg.payload?.path || ''));
-            ws.send(JSON.stringify({ type: 'command_result', commandId: msg.commandId, ok: true, output: { path: fp, content: fs.readFileSync(fp, 'utf-8').slice(0, 120000) } }));
-          } else {
-            ws.send(JSON.stringify({ type: 'command_result', commandId: msg.commandId, ok: false, error: 'Comando não suportado no Desktop.' }));
-          }
+          const out = await handleLocalMeshCommand(String(msg.commandType || ''), msg.payload || {}, 'Aegis Mesh');
+          ws.send(JSON.stringify({ type: 'command_result', commandId: msg.commandId, ok: out.ok, output: out.output, error: out.error }));
         } catch (err) {
           ws.send(JSON.stringify({ type: 'command_result', commandId: msg.commandId, ok: false, error: err.message }));
         }
@@ -2627,7 +3299,12 @@ function startCloudRelay() {
 
   ws.addEventListener('close', () => {
     if (adbTimer) clearInterval(adbTimer);
-    setTimeout(startCloudRelay, 8000);
+    cloudRelayState = 'reconnecting';
+    cloudReconnectTimer = setTimeout(startCloudRelay, 8000);
+  });
+
+  ws.addEventListener('error', () => {
+    cloudRelayState = 'reconnecting';
   });
 }
 
@@ -2641,8 +3318,11 @@ server.on('error', (err) => {
 });
 
 server.listen(PORT, '127.0.0.1', () => {
-  console.log('[' + new Date().toISOString() + '] Aegis Desktop Daemon v2.1.0 ativo em http://127.0.0.1:' + PORT + ' (Zero-Dep · Linux/Windows + Ponte ADB Android)');
+  console.log('[' + new Date().toISOString() + '] Aegis Desktop Daemon v2.1.0 ativo em http://127.0.0.1:' + PORT + ' (Malha Automática: LAN UDP/P2P + Nuvem WS + ADB USB/Wi-Fi)');
+  startLanDiscovery();
+  startLanMeshServer();
   startCloudRelay();
+  void listAdbDevicesDesktop();
 });
 `;
 

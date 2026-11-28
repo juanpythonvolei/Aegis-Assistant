@@ -2037,6 +2037,8 @@ dependencies {
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -2120,11 +2122,15 @@ dependencies {
 
 import android.content.Context
 import android.net.Uri
+import java.security.MessageDigest
+import java.util.UUID
 
 object AegisConfig {
     const val DEFAULT_SERVER_ORIGIN = "${safeOrigin}"
     const val DEFAULT_WS_URL = "${wsUrl}"
     const val PREFILLED_PAIRING_CODE = "${safeCode}"
+    const val LAN_DISCOVERY_PORT = 38471
+    const val LAN_MESH_PORT = 38472
 
     private const val PREFS = "aegis_native_prefs"
 
@@ -2144,6 +2150,48 @@ object AegisConfig {
         } catch (_: Exception) {
             ""
         }
+    }
+
+    fun getDeviceId(ctx: Context): String {
+        val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val existing = prefs.getString("mesh_device_id", "") ?: ""
+        if (existing.isNotBlank()) return existing
+        val created = "aegis_android_" + UUID.randomUUID().toString().replace("-", "").take(12)
+        prefs.edit().putString("mesh_device_id", created).apply()
+        return created
+    }
+
+    fun getMeshKey(ctx: Context): String {
+        return ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("mesh_key", "") ?: ""
+    }
+
+    fun setMeshKey(ctx: Context, key: String) {
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString("mesh_key", key.trim().take(128))
+            .apply()
+    }
+
+    fun getGoogleEmail(ctx: Context): String {
+        return ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("google_email", "") ?: ""
+    }
+
+    fun setGoogleEmail(ctx: Context, email: String) {
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString("google_email", email.trim().lowercase())
+            .apply()
+    }
+
+    fun getEffectiveMeshSecret(ctx: Context): Pair<String, String> {
+        val key = getMeshKey(ctx).trim()
+        if (key.isNotBlank()) return Pair(key, "custom_key")
+        val email = getGoogleEmail(ctx).trim().lowercase()
+        if (email.isNotBlank()) {
+            val digest = MessageDigest.getInstance("SHA-256")
+                .digest(("aegis-google-mesh:" + email).toByteArray(Charsets.UTF_8))
+            val hex = digest.joinToString("") { String.format("%02x", it) }
+            return Pair(hex, "google_account")
+        }
+        return Pair("", "none")
     }
 
     fun getServerOrigin(ctx: Context): String {
@@ -2320,7 +2368,10 @@ class MainActivity : AppCompatActivity() {
         // Carrega imediatamente a HUD Holografica 3D embarcada (zero tela branca, zero erro de rede)
         webView.loadUrl(localHudUrl)
 
-        // Apenas auto-inicia o ForegroundService se ja houver token pareado + servidor valido
+        // Inicia automaticamente a descoberta LAN Wi-Fi/P2P (zero cabo / zero ADB)
+        AegisForegroundService.ensureLanMeshStarted(applicationContext)
+
+        // Auto-inicia o ForegroundService se ja houver token pareado + servidor valido
         if (AegisConfig.getDeviceToken(this).isNotBlank() && AegisConfig.getWsUrl(this).isNotBlank()) {
             startAegisServiceSafely()
         }
@@ -2526,6 +2577,82 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+
+        @JavascriptInterface
+        fun getMeshStatusJson(): String {
+            return try {
+                AegisForegroundService.getMeshStatusJson(this@MainActivity)
+            } catch (_: Exception) {
+                "{}"
+            }
+        }
+
+        @JavascriptInterface
+        fun scanLanMesh(): String {
+            return try {
+                AegisForegroundService.ensureLanMeshStarted(applicationContext)
+                AegisForegroundService.triggerLanProbe(this@MainActivity)
+                AegisForegroundService.requestCloudPeers()
+                Thread.sleep(600)
+                AegisForegroundService.getMeshStatusJson(this@MainActivity)
+            } catch (_: Exception) {
+                AegisForegroundService.getMeshStatusJson(this@MainActivity)
+            }
+        }
+
+        @JavascriptInterface
+        fun setMeshKey(key: String?): String {
+            return try {
+                AegisConfig.setMeshKey(this@MainActivity, key ?: "")
+                AegisForegroundService.ensureLanMeshStarted(applicationContext)
+                AegisForegroundService.triggerLanProbe(this@MainActivity)
+                AegisForegroundService.getMeshStatusJson(this@MainActivity)
+            } catch (e: Exception) {
+                JSONObject().apply {
+                    put("ok", false)
+                    put("error", e.message ?: "Erro ao salvar chave")
+                }.toString()
+            }
+        }
+
+        @JavascriptInterface
+        fun execPeerCommandJson(peerId: String?, commandType: String?, payloadJson: String?): String {
+            return try {
+                val payload = try {
+                    if (!payloadJson.isNullOrBlank()) JSONObject(payloadJson) else JSONObject()
+                } catch (_: Exception) {
+                    JSONObject()
+                }
+                AegisForegroundService.execPeerCommandSync(
+                    this@MainActivity,
+                    peerId ?: "",
+                    commandType ?: "ping",
+                    payload
+                ).toString()
+            } catch (e: Exception) {
+                JSONObject().apply {
+                    put("ok", false)
+                    put("error", e.message ?: "Falha na execucao remota")
+                }.toString()
+            }
+        }
+
+        @JavascriptInterface
+        fun syncClipboardToMesh(text: String?): String {
+            return try {
+                val clean = (text ?: "").take(32768)
+                val delivered = AegisForegroundService.broadcastClipboardSync(this@MainActivity, clean)
+                JSONObject().apply {
+                    put("ok", true)
+                    put("delivered", delivered)
+                }.toString()
+            } catch (e: Exception) {
+                JSONObject().apply {
+                    put("ok", false)
+                    put("error", e.message ?: "Falha ao sincronizar area de transferencia")
+                }.toString()
+            }
+        }
     }
 }
 `
@@ -2539,31 +2666,66 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
+import android.net.wifi.WifiManager
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Environment
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.StatFs
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.BufferedInputStream
 import java.io.File
+import java.io.OutputStreamWriter
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.Inet4Address
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.NetworkInterface
+import java.net.ServerSocket
+import java.net.Socket
+import java.security.MessageDigest
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
+
+data class AegisMeshPeer(
+    val id: String,
+    val name: String,
+    val platform: String,
+    val lanIp: String,
+    val meshPort: Int,
+    val status: String,
+    val lastSeenMs: Long
+)
 
 class AegisForegroundService : Service() {
 
@@ -2574,6 +2736,665 @@ class AegisForegroundService : Service() {
         var connectionState: String = "idle"
         @Volatile
         var lastError: String = ""
+        @Volatile
+        var lanDiscoveryActive: Boolean = false
+        @Volatile
+        var lanServerActive: Boolean = false
+        @Volatile
+        var cloudSelfId: String = ""
+        @Volatile
+        var activeInstance: AegisForegroundService? = null
+        @Volatile
+        var recentClipboard: JSONObject? = null
+
+        private val meshScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        private val lanPeers = ConcurrentHashMap<String, AegisMeshPeer>()
+        private val cloudPeers = ConcurrentHashMap<String, AegisMeshPeer>()
+        private val pendingCloudCmds = ConcurrentHashMap<String, Pair<CountDownLatch, Array<JSONObject?>>>()
+        private val httpClient = OkHttpClient.Builder()
+            .connectTimeout(7, TimeUnit.SECONDS)
+            .readTimeout(10, TimeUnit.SECONDS)
+            .build()
+
+        @Volatile
+        private var lanStarted = false
+        @Volatile
+        private var udpSocket: DatagramSocket? = null
+        @Volatile
+        private var tcpServer: ServerSocket? = null
+        @Volatile
+        private var multicastLock: WifiManager.MulticastLock? = null
+
+        fun getLocalIpv4Addresses(): List<String> {
+            val ips = mutableListOf<String>()
+            try {
+                val interfaces = NetworkInterface.getNetworkInterfaces()
+                while (interfaces != null && interfaces.hasMoreElements()) {
+                    val nif = interfaces.nextElement()
+                    if (!nif.isUp || nif.isLoopback) continue
+                    val addrs = nif.inetAddresses
+                    while (addrs.hasMoreElements()) {
+                        val addr = addrs.nextElement()
+                        if (addr is Inet4Address && !addr.isLoopbackAddress) {
+                            val host = addr.hostAddress ?: continue
+                            if (host != "127.0.0.1") ips.add(host)
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+            return ips
+        }
+
+        private fun computeHmacSha256(secret: String, ts: String, body: String): String {
+            val mac = Mac.getInstance("HmacSHA256")
+            mac.init(SecretKeySpec(secret.toByteArray(Charsets.UTF_8), "HmacSHA256"))
+            val raw = mac.doFinal((ts + "." + body).toByteArray(Charsets.UTF_8))
+            return raw.joinToString("") { String.format("%02x", it) }
+        }
+
+        private fun verifyHmacSha256(secret: String, tsHeader: String, sigHeader: String, body: String): Boolean {
+            if (secret.isBlank() || tsHeader.isBlank() || sigHeader.isBlank()) return false
+            val ts = tsHeader.toLongOrNull() ?: return false
+            if (kotlin.math.abs(System.currentTimeMillis() - ts) > 60_000L) return false
+            val expected = computeHmacSha256(secret, tsHeader, body)
+            return MessageDigest.isEqual(
+                expected.toByteArray(Charsets.UTF_8),
+                sigHeader.trim().lowercase().toByteArray(Charsets.UTF_8)
+            )
+        }
+
+        private fun buildBeaconPacket(ctx: Context, proto: String): String {
+            val ips = getLocalIpv4Addresses()
+            val sec = AegisConfig.getEffectiveMeshSecret(ctx)
+            val id = if (cloudSelfId.isNotBlank()) cloudSelfId else AegisConfig.getDeviceId(ctx)
+            return JSONObject().apply {
+                put("proto", proto)
+                put("deviceId", id)
+                put("name", Build.MANUFACTURER + " " + Build.MODEL + " (Android)")
+                put("platform", "android")
+                put("lanIp", ips.firstOrNull() ?: "")
+                put("lanIps", JSONArray(ips))
+                put("meshPort", AegisConfig.LAN_MESH_PORT)
+                put("authMode", sec.second)
+                put("capabilities", JSONArray(listOf(
+                    "ping", "telemetry", "list_files", "read_file", "list_apps",
+                    "open_app", "tap", "swipe", "keyevent", "notify", "clipboard_sync"
+                )))
+                put("ts", System.currentTimeMillis())
+            }.toString()
+        }
+
+        private fun sendUdpBroadcast(packetStr: String) {
+            val sock = udpSocket ?: return
+            val data = packetStr.toByteArray(Charsets.UTF_8)
+            val targets = linkedSetOf("255.255.255.255")
+            for (ip in getLocalIpv4Addresses()) {
+                val parts = ip.split(".")
+                if (parts.size == 4) {
+                    targets.add(parts[0] + "." + parts[1] + "." + parts[2] + ".255")
+                }
+            }
+            for (addr in targets) {
+                try {
+                    val pkt = DatagramPacket(data, data.size, InetAddress.getByName(addr), AegisConfig.LAN_DISCOVERY_PORT)
+                    sock.send(pkt)
+                } catch (_: Exception) {}
+            }
+        }
+
+        fun triggerLanProbe(ctx: Context) {
+            meshScope.launch {
+                try {
+                    sendUdpBroadcast(buildBeaconPacket(ctx, "aegis-mesh-probe"))
+                    sendUdpBroadcast(buildBeaconPacket(ctx, "aegis-mesh-v1"))
+                } catch (_: Exception) {}
+            }
+        }
+
+        fun requestCloudPeers() {
+            try {
+                activeInstance?.webSocket?.send(JSONObject().apply { put("type", "get_peers") }.toString())
+            } catch (_: Exception) {}
+        }
+
+        fun ensureLanMeshStarted(appCtx: Context) {
+            if (lanStarted) return
+            synchronized(this) {
+                if (lanStarted) return
+                lanStarted = true
+            }
+            try {
+                val wm = appCtx.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+                val lock = wm?.createMulticastLock("aegis_mesh_udp")
+                lock?.setReferenceCounted(false)
+                lock?.acquire()
+                multicastLock = lock
+            } catch (_: Exception) {}
+
+            // 1. UDP :38471 Discovery listener + beacon broadcaster
+            meshScope.launch {
+                try {
+                    val sock = DatagramSocket(null).apply {
+                        reuseAddress = true
+                        broadcast = true
+                        bind(InetSocketAddress(AegisConfig.LAN_DISCOVERY_PORT))
+                    }
+                    udpSocket = sock
+                    lanDiscoveryActive = true
+
+                    // Periodic broadcast loop
+                    meshScope.launch {
+                        while (isActive && lanDiscoveryActive) {
+                            val now = System.currentTimeMillis()
+                            lanPeers.entries.removeIf { now - it.value.lastSeenMs > 35_000L }
+                            sendUdpBroadcast(buildBeaconPacket(appCtx, "aegis-mesh-v1"))
+                            delay(6000)
+                        }
+                    }
+
+                    triggerLanProbe(appCtx)
+                    val buf = ByteArray(8192)
+                    while (isActive && !sock.isClosed) {
+                        val packet = DatagramPacket(buf, buf.size)
+                        sock.receive(packet)
+                        try {
+                            val txt = String(packet.data, 0, packet.length, Charsets.UTF_8)
+                            val obj = JSONObject(txt)
+                            val proto = obj.optString("proto")
+                            if (proto != "aegis-mesh-v1" && proto != "aegis-mesh-probe") continue
+                            val peerId = obj.optString("deviceId")
+                            val selfId = if (cloudSelfId.isNotBlank()) cloudSelfId else AegisConfig.getDeviceId(appCtx)
+                            if (peerId.isBlank() || peerId == selfId || peerId == AegisConfig.getDeviceId(appCtx)) continue
+                            val peerIp = packet.address?.hostAddress ?: obj.optString("lanIp")
+                            if (peerIp.isBlank() || peerIp == "127.0.0.1") continue
+                            lanPeers[peerId] = AegisMeshPeer(
+                                id = peerId,
+                                name = obj.optString("name", peerId),
+                                platform = obj.optString("platform", "unknown"),
+                                lanIp = peerIp,
+                                meshPort = obj.optInt("meshPort", AegisConfig.LAN_MESH_PORT),
+                                status = "online",
+                                lastSeenMs = System.currentTimeMillis()
+                            )
+                            if (proto == "aegis-mesh-probe") {
+                                val replyBytes = buildBeaconPacket(appCtx, "aegis-mesh-v1").toByteArray(Charsets.UTF_8)
+                                sock.send(DatagramPacket(replyBytes, replyBytes.size, packet.address, packet.port))
+                            }
+                        } catch (_: Exception) {}
+                    }
+                } catch (_: Exception) {
+                    lanDiscoveryActive = false
+                }
+            }
+
+            // 2. TCP/HTTP :38472 Authenticated LAN P2P Server
+            meshScope.launch {
+                try {
+                    val srv = ServerSocket()
+                    srv.reuseAddress = true
+                    srv.bind(InetSocketAddress(AegisConfig.LAN_MESH_PORT))
+                    tcpServer = srv
+                    lanServerActive = true
+                    while (isActive && !srv.isClosed) {
+                        val clientSock = srv.accept()
+                        meshScope.launch {
+                            handleLanHttpClient(appCtx, clientSock)
+                        }
+                    }
+                } catch (_: Exception) {
+                    lanServerActive = false
+                }
+            }
+        }
+
+        private fun readHttpRequest(sock: Socket): Triple<String, Map<String, String>, String>? {
+            sock.soTimeout = 6000
+            val ins = BufferedInputStream(sock.getInputStream())
+            val headerBytes = ArrayList<Byte>()
+            var state = 0
+            while (headerBytes.size < 16384) {
+                val b = ins.read()
+                if (b == -1) break
+                headerBytes.add(b.toByte())
+                state = when {
+                    state == 0 && b == 13 -> 1
+                    state == 1 && b == 10 -> 2
+                    state == 2 && b == 13 -> 3
+                    state == 3 && b == 10 -> 4
+                    else -> 0
+                }
+                if (state == 4) break
+            }
+            if (headerBytes.isEmpty()) return null
+            val headerStr = String(headerBytes.toByteArray(), Charsets.UTF_8)
+            val lines = headerStr.split("\\r\\n")
+            val requestLine = lines.firstOrNull() ?: return null
+            val headers = mutableMapOf<String, String>()
+            for (i in 1 until lines.size) {
+                val idx = lines[i].indexOf(':')
+                if (idx > 0) {
+                    headers[lines[i].substring(0, idx).trim().lowercase()] = lines[i].substring(idx + 1).trim()
+                }
+            }
+            val contentLen = (headers["content-length"]?.toIntOrNull() ?: 0).coerceIn(0, 512 * 1024)
+            val bodyBuf = ByteArray(contentLen)
+            var readTotal = 0
+            while (readTotal < contentLen) {
+                val n = ins.read(bodyBuf, readTotal, contentLen - readTotal)
+                if (n <= 0) break
+                readTotal += n
+            }
+            val body = String(bodyBuf, 0, readTotal, Charsets.UTF_8)
+            return Triple(requestLine, headers, body)
+        }
+
+        private fun writeHttpJson(sock: Socket, statusCode: Int, statusText: String, json: String) {
+            val bytes = json.toByteArray(Charsets.UTF_8)
+            val resp = "HTTP/1.1 " + statusCode + " " + statusText + "\\r\\n" +
+                "Content-Type: application/json; charset=utf-8\\r\\n" +
+                "Content-Length: " + bytes.size + "\\r\\n" +
+                "Connection: close\\r\\n\\r\\n"
+            val out = sock.getOutputStream()
+            out.write(resp.toByteArray(Charsets.UTF_8))
+            out.write(bytes)
+            out.flush()
+        }
+
+        private fun handleLanHttpClient(ctx: Context, sock: Socket) {
+            try {
+                val req = readHttpRequest(sock) ?: return
+                val parts = req.first.split(" ")
+                val method = parts.getOrNull(0) ?: ""
+                val path = parts.getOrNull(1) ?: "/"
+                if (method == "GET" && path == "/mesh/info") {
+                    val ips = getLocalIpv4Addresses()
+                    val sec = AegisConfig.getEffectiveMeshSecret(ctx)
+                    val info = JSONObject().apply {
+                        put("deviceId", if (cloudSelfId.isNotBlank()) cloudSelfId else AegisConfig.getDeviceId(ctx))
+                        put("name", Build.MANUFACTURER + " " + Build.MODEL + " (Android)")
+                        put("platform", "android")
+                        put("lanIps", JSONArray(ips))
+                        put("meshPort", AegisConfig.LAN_MESH_PORT)
+                        put("authRequired", true)
+                        put("authMode", sec.second)
+                    }
+                    writeHttpJson(sock, 200, "OK", info.toString())
+                    return
+                }
+                if (method == "POST" && path == "/mesh/exec") {
+                    val sec = AegisConfig.getEffectiveMeshSecret(ctx)
+                    if (sec.first.isBlank()) {
+                        writeHttpJson(sock, 401, "Unauthorized", JSONObject().apply {
+                            put("ok", false)
+                            put("error", "Defina a mesma Chave de Malha LAN no Android e no PC para liberar comandos diretos Wi-Fi.")
+                        }.toString())
+                        return
+                    }
+                    val tsHdr = req.second["x-aegis-mesh-ts"] ?: ""
+                    val sigHdr = req.second["x-aegis-mesh-sig"] ?: ""
+                    if (!verifyHmacSha256(sec.first, tsHdr, sigHdr, req.third)) {
+                        writeHttpJson(sock, 401, "Unauthorized", JSONObject().apply {
+                            put("ok", false)
+                            put("error", "Assinatura HMAC da Malha LAN invalida ou expirada.")
+                        }.toString())
+                        return
+                    }
+                    val parsed = JSONObject(req.third.ifBlank { "{}" })
+                    val cmdType = parsed.optString("commandType")
+                    val payload = parsed.optJSONObject("payload") ?: JSONObject()
+                    val fromName = parsed.optString("fromName", "LAN Peer")
+                    val res = executeLocalAndroidCommand(ctx, cmdType, payload, fromName)
+                    writeHttpJson(sock, if (res.optBoolean("ok")) 200 else 400, if (res.optBoolean("ok")) "OK" else "Bad Request", res.toString())
+                    return
+                }
+                writeHttpJson(sock, 404, "Not Found", JSONObject().apply { put("ok", false); put("error", "Not Found") }.toString())
+            } catch (_: Exception) {
+            } finally {
+                try { sock.close() } catch (_: Exception) {}
+            }
+        }
+
+        private fun setAndroidClipboard(ctx: Context, text: String) {
+            try {
+                Handler(Looper.getMainLooper()).post {
+                    try {
+                        val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                        cm?.setPrimaryClip(ClipData.newPlainText("Aegis Mesh", text))
+                    } catch (_: Exception) {}
+                }
+            } catch (_: Exception) {}
+        }
+
+        fun executeLocalAndroidCommand(ctx: Context, cmdType: String, payload: JSONObject, fromName: String): JSONObject {
+            var ok = true
+            val output = JSONObject()
+            try {
+                when (cmdType) {
+                    "ping" -> {
+                        output.put("pong", true)
+                        output.put("model", Build.MANUFACTURER + " " + Build.MODEL)
+                        output.put("platform", "android")
+                        output.put("lanIps", JSONArray(getLocalIpv4Addresses()))
+                        output.put("ts", System.currentTimeMillis())
+                    }
+                    "clipboard_sync" -> {
+                        val txt = payload.optString("text", "").take(32768)
+                        recentClipboard = JSONObject().apply {
+                            put("fromName", fromName)
+                            put("text", txt)
+                            put("transport", "lan_p2p")
+                            put("receivedAt", System.currentTimeMillis())
+                        }
+                        setAndroidClipboard(ctx, txt)
+                        output.put("received", true)
+                        output.put("length", txt.length)
+                    }
+                    "telemetry" -> {
+                        val inst = activeInstance
+                        if (inst != null) {
+                            output.put("telemetry", inst.collectTelemetry())
+                            output.put("storage", inst.collectStorage())
+                            inst.sendSnapshot()
+                        } else {
+                            output.put("model", Build.MANUFACTURER + " " + Build.MODEL)
+                            output.put("androidVersion", Build.VERSION.RELEASE)
+                            output.put("lanIps", JSONArray(getLocalIpv4Addresses()))
+                        }
+                    }
+                    "list_files" -> {
+                        val target = payload.optString("path", Environment.getExternalStorageDirectory().absolutePath)
+                        val dir = File(target)
+                        val entries = JSONArray()
+                        dir.listFiles()?.sortedBy { it.name }?.take(150)?.forEach { f ->
+                            entries.put(JSONObject().apply {
+                                put("name", f.name)
+                                put("path", f.absolutePath)
+                                put("type", if (f.isDirectory) "directory" else "file")
+                                put("size", f.length())
+                            })
+                        }
+                        output.put("path", dir.absolutePath)
+                        output.put("entries", entries)
+                    }
+                    "read_file" -> {
+                        val fp = payload.optString("path", "")
+                        val f = File(fp)
+                        if (!f.exists() || !f.isFile) {
+                            ok = false
+                            output.put("error", "Arquivo nao encontrado: " + fp)
+                        } else {
+                            output.put("path", f.absolutePath)
+                            output.put("content", f.readText().take(20_000))
+                        }
+                    }
+                    "list_apps", "list_packages" -> {
+                        val arr = JSONArray()
+                        val pm = ctx.packageManager
+                        pm.getInstalledApplications(0).take(120).forEach { app ->
+                            arr.put(JSONObject().apply {
+                                put("package", app.packageName)
+                                put("label", pm.getApplicationLabel(app).toString())
+                            })
+                        }
+                        output.put("apps", arr)
+                    }
+                    "open_app" -> {
+                        val pkg = payload.optString("packageName", payload.optString("package", ""))
+                        val launch = ctx.packageManager.getLaunchIntentForPackage(pkg)
+                        if (launch != null) {
+                            launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            ctx.startActivity(launch)
+                            output.put("launched", pkg)
+                        } else {
+                            ok = false
+                            output.put("error", "Pacote nao encontrado: " + pkg)
+                        }
+                    }
+                    "tap", "input_tap" -> {
+                        val acc = AegisAccessibilityService.instance
+                        if (acc == null) {
+                            ok = false
+                            output.put("error", "Ative AegisAccessibilityService nas configuracoes do Android.")
+                        } else {
+                            val x = payload.optDouble("x", 540.0).toFloat()
+                            val y = payload.optDouble("y", 1200.0).toFloat()
+                            acc.performTap(x, y)
+                            output.put("tapped", x.toString() + "," + y.toString())
+                        }
+                    }
+                    "swipe" -> {
+                        val acc = AegisAccessibilityService.instance
+                        if (acc == null) {
+                            ok = false
+                            output.put("error", "Ative AegisAccessibilityService nas configuracoes do Android.")
+                        } else {
+                            acc.performSwipe(
+                                payload.optDouble("x1", 500.0).toFloat(),
+                                payload.optDouble("y1", 1500.0).toFloat(),
+                                payload.optDouble("x2", 500.0).toFloat(),
+                                payload.optDouble("y2", 500.0).toFloat()
+                            )
+                            output.put("swiped", true)
+                        }
+                    }
+                    "keyevent", "input_keyevent" -> {
+                        val acc = AegisAccessibilityService.instance
+                        val key = payload.optString("key", "HOME")
+                        if (acc != null) {
+                            acc.performGlobalKey(key)
+                            output.put("key", key)
+                        } else {
+                            ok = false
+                            output.put("error", "Ative AegisAccessibilityService nas configuracoes do Android.")
+                        }
+                    }
+                    "ui_dump" -> {
+                        val acc = AegisAccessibilityService.instance
+                        if (acc != null) {
+                            output.put("nodes", acc.dumpScreenNodes())
+                        } else {
+                            ok = false
+                            output.put("error", "Ative AegisAccessibilityService nas configuracoes do Android.")
+                        }
+                    }
+                    "notify" -> {
+                        val title = payload.optString("title", "Aegis")
+                        val text = payload.optString("text", payload.optString("content", ""))
+                        val nm = ctx.getSystemService(NotificationManager::class.java)
+                        nm?.notify(
+                            (System.currentTimeMillis() % 10000).toInt(),
+                            NotificationCompat.Builder(ctx, "aegis_native_agent")
+                                .setContentTitle(title)
+                                .setContentText(text)
+                                .setSmallIcon(android.R.drawable.ic_dialog_info)
+                                .build()
+                        )
+                        output.put("notified", true)
+                    }
+                    else -> {
+                        ok = false
+                        output.put("error", "Comando nao suportado no Android: " + cmdType)
+                    }
+                }
+            } catch (e: Exception) {
+                ok = false
+                output.put("error", e.message ?: "Erro ao executar comando no Android")
+            }
+            return JSONObject().apply {
+                put("ok", ok)
+                put("output", output)
+                if (!ok) put("error", output.optString("error", "Falha"))
+            }
+        }
+
+        private fun getMergedPeers(): List<Pair<AegisMeshPeer, List<String>>> {
+            val merged = linkedMapOf<String, Pair<AegisMeshPeer, MutableList<String>>>()
+            for (p in lanPeers.values) {
+                merged[p.id] = Pair(p, mutableListOf("lan_p2p"))
+            }
+            for (p in cloudPeers.values) {
+                val cur = merged[p.id]
+                if (cur != null) {
+                    if (!cur.second.contains("cloud_ws")) cur.second.add("cloud_ws")
+                } else {
+                    val trs = mutableListOf<String>()
+                    if (p.lanIp.isNotBlank()) trs.add("lan_p2p")
+                    if (p.status == "online") trs.add("cloud_ws")
+                    merged[p.id] = Pair(p, trs)
+                }
+            }
+            return merged.values.map { Pair(it.first, it.second.toList()) }
+        }
+
+        fun getMeshStatusJson(ctx: Context): String {
+            val sec = AegisConfig.getEffectiveMeshSecret(ctx)
+            val peersArr = JSONArray()
+            for ((peer, transports) in getMergedPeers()) {
+                peersArr.put(JSONObject().apply {
+                    put("id", peer.id)
+                    put("name", peer.name)
+                    put("platform", peer.platform)
+                    put("status", peer.status)
+                    put("lanIp", peer.lanIp)
+                    put("meshPort", peer.meshPort)
+                    put("transports", JSONArray(transports))
+                })
+            }
+            return JSONObject().apply {
+                put("selfId", if (cloudSelfId.isNotBlank()) cloudSelfId else AegisConfig.getDeviceId(ctx))
+                put("name", Build.MANUFACTURER + " " + Build.MODEL + " (Android)")
+                put("platform", "android")
+                put("lanIps", JSONArray(getLocalIpv4Addresses()))
+                put("lanDiscoveryPort", AegisConfig.LAN_DISCOVERY_PORT)
+                put("lanMeshPort", AegisConfig.LAN_MESH_PORT)
+                put("meshKeyConfigured", AegisConfig.getMeshKey(ctx).isNotBlank())
+                put("meshSecretSource", sec.second)
+                put("cloudOrigin", AegisConfig.getServerOrigin(ctx))
+                put("transports", JSONObject().apply {
+                    put("lanDiscovery", lanDiscoveryActive)
+                    put("lanP2p", lanServerActive)
+                    put("cloudWs", connectionState)
+                    put("adbCount", 0)
+                })
+                put("peers", peersArr)
+                if (recentClipboard != null) put("recentClipboard", recentClipboard)
+            }.toString()
+        }
+
+        private fun sendLanP2pSync(ctx: Context, lanIp: String, meshPort: Int, commandType: String, payload: JSONObject): JSONObject {
+            val sec = AegisConfig.getEffectiveMeshSecret(ctx)
+            if (sec.first.isBlank()) {
+                return JSONObject().apply {
+                    put("ok", false)
+                    put("error", "Defina a mesma Chave de Malha LAN aqui e no PC para executar comandos diretos via Wi-Fi.")
+                }
+            }
+            val bodyStr = JSONObject().apply {
+                put("fromId", if (cloudSelfId.isNotBlank()) cloudSelfId else AegisConfig.getDeviceId(ctx))
+                put("fromName", Build.MANUFACTURER + " " + Build.MODEL)
+                put("commandType", commandType)
+                put("payload", payload)
+            }.toString()
+            val ts = System.currentTimeMillis().toString()
+            val sig = computeHmacSha256(sec.first, ts, bodyStr)
+            return try {
+                val req = Request.Builder()
+                    .url("http://" + lanIp + ":" + meshPort + "/mesh/exec")
+                    .post(bodyStr.toRequestBody("application/json; charset=utf-8".toMediaType()))
+                    .header("X-Aegis-Mesh-Ts", ts)
+                    .header("X-Aegis-Mesh-Sig", sig)
+                    .build()
+                httpClient.newCall(req).execute().use { resp ->
+                    val txt = resp.body?.string() ?: "{}"
+                    val parsed = try { JSONObject(txt) } catch (_: Exception) { JSONObject().apply { put("ok", false); put("error", txt) } }
+                    parsed.put("transportUsed", "lan_p2p")
+                    parsed
+                }
+            } catch (e: Exception) {
+                JSONObject().apply {
+                    put("ok", false)
+                    put("error", "Falha LAN P2P: " + (e.message ?: "sem resposta"))
+                }
+            }
+        }
+
+        private fun sendCloudPeerCommandSync(targetId: String, commandType: String, payload: JSONObject): JSONObject {
+            val ws = activeInstance?.webSocket ?: return JSONObject().apply {
+                put("ok", false)
+                put("error", "Nuvem WebSocket nao conectada.")
+            }
+            val reqId = "and_" + UUID.randomUUID().toString().take(8)
+            val latch = CountDownLatch(1)
+            val holder = arrayOfNulls<JSONObject>(1)
+            pendingCloudCmds[reqId] = Pair(latch, holder)
+            val sent = ws.send(JSONObject().apply {
+                put("type", "peer_command")
+                put("requestId", reqId)
+                put("targetDeviceId", targetId)
+                put("commandType", commandType)
+                put("payload", payload)
+            }.toString())
+            if (!sent) {
+                pendingCloudCmds.remove(reqId)
+                return JSONObject().apply { put("ok", false); put("error", "Falha ao enviar pela Nuvem WS.") }
+            }
+            latch.await(15, TimeUnit.SECONDS)
+            pendingCloudCmds.remove(reqId)
+            val res = holder[0] ?: JSONObject().apply { put("ok", false); put("error", "Timeout na Nuvem WS.") }
+            res.put("transportUsed", "cloud_ws")
+            return res
+        }
+
+        fun execPeerCommandSync(ctx: Context, peerId: String, commandType: String, payload: JSONObject): JSONObject {
+            val pair = getMergedPeers().find { it.first.id == peerId }
+                ?: return JSONObject().apply {
+                    put("ok", false)
+                    put("error", "Dispositivo nao encontrado na malha. Toque em Escanear Malha.")
+                }
+            val peer = pair.first
+            val transports = pair.second
+            val errors = mutableListOf<String>()
+            if (peer.lanIp.isNotBlank()) {
+                val lanRes = sendLanP2pSync(ctx, peer.lanIp, peer.meshPort, commandType, payload)
+                if (lanRes.optBoolean("ok")) return lanRes
+                errors.add("LAN: " + lanRes.optString("error", "falhou"))
+            }
+            if (transports.contains("cloud_ws")) {
+                val cloudRes = sendCloudPeerCommandSync(peer.id, commandType, payload)
+                if (cloudRes.optBoolean("ok")) return cloudRes
+                errors.add("Nuvem: " + cloudRes.optString("error", "falhou"))
+            }
+            return JSONObject().apply {
+                put("ok", false)
+                put("error", "Todos os transportes falharam (" + errors.joinToString(" | ") + ")")
+            }
+        }
+
+        fun broadcastClipboardSync(ctx: Context, text: String): Int {
+            var delivered = 0
+            recentClipboard = JSONObject().apply {
+                put("fromName", Build.MODEL + " (este celular)")
+                put("text", text)
+                put("transport", "local")
+                put("receivedAt", System.currentTimeMillis())
+            }
+            val payload = JSONObject().apply { put("text", text) }
+            for ((peer, _) in getMergedPeers()) {
+                if (peer.lanIp.isNotBlank()) {
+                    val r = sendLanP2pSync(ctx, peer.lanIp, peer.meshPort, "clipboard_sync", payload)
+                    if (r.optBoolean("ok")) delivered++
+                }
+            }
+            val ws = activeInstance?.webSocket
+            if (ws != null) {
+                try {
+                    if (ws.send(JSONObject().apply { put("type", "clipboard_broadcast"); put("text", text) }.toString())) {
+                        delivered++
+                    }
+                } catch (_: Exception) {}
+            }
+            return delivered
+        }
     }
 
     private val client = OkHttpClient.Builder()
@@ -2581,7 +3402,7 @@ class AegisForegroundService : Service() {
         .connectTimeout(12, TimeUnit.SECONDS)
         .build()
 
-    private var webSocket: WebSocket? = null
+    internal var webSocket: WebSocket? = null
     private val serviceJob = Job()
     private val scope = CoroutineScope(Dispatchers.IO + serviceJob)
     private var telemetryLoopStarted = false
@@ -2590,9 +3411,10 @@ class AegisForegroundService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         isRunning = true
+        activeInstance = this
         lastError = ""
         try {
-            val notif = buildNotification("Conectando ao Orquestrador Aegis...")
+            val notif = buildNotification("Malha Aegis ativa (Wi-Fi/LAN + Nuvem)")
             val fgType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
             } else {
@@ -2602,6 +3424,8 @@ class AegisForegroundService : Service() {
         } catch (e: Exception) {
             lastError = e.message ?: "Erro ao ativar ForegroundService"
         }
+
+        ensureLanMeshStarted(applicationContext)
 
         scope.launch {
             connectSocket()
@@ -2659,19 +3483,26 @@ class AegisForegroundService : Service() {
             override fun onOpen(ws: WebSocket, response: Response) {
                 connectionState = "online"
                 lastError = ""
-                updateNotification("Conectado a " + AegisConfig.getServerOrigin(this@AegisForegroundService))
+                updateNotification("Conectado: LAN Wi-Fi + " + AegisConfig.getServerOrigin(this@AegisForegroundService))
                 try {
+                    val ips = getLocalIpv4Addresses()
                     val hello = JSONObject().apply {
                         put("type", "hello")
                         put("name", Build.MANUFACTURER + " " + Build.MODEL)
                         put("platform", "android")
                         put("transport", "android_app_ws")
-                        put("serialOrUid", Build.BRAND + "_" + Build.MODEL)
+                        put("serialOrUid", AegisConfig.getDeviceId(this@AegisForegroundService))
                         val token = AegisConfig.getDeviceToken(this@AegisForegroundService)
                         if (token.isNotBlank()) put("token", token)
                         else put("pairingCode", AegisConfig.getPairingCode(this@AegisForegroundService))
+                        put("telemetry", collectTelemetry())
+                        put("lanIp", ips.firstOrNull() ?: "")
+                        put("meshPort", AegisConfig.LAN_MESH_PORT)
                         put("capabilities", JSONArray(listOf(
+                            "ping",
                             "android_native_app",
+                            "lan_p2p",
+                            "clipboard_sync",
                             "accessibility_gestures",
                             "notification_listener",
                             "file_system",
@@ -2687,14 +3518,57 @@ class AegisForegroundService : Service() {
                 try {
                     val msg = JSONObject(text)
                     when (msg.optString("type")) {
-                        "paired" -> {
+                        "paired", "authenticated" -> {
                             val token = msg.optString("token")
+                            val devId = msg.optString("deviceId")
+                            if (devId.isNotBlank()) cloudSelfId = devId
                             if (token.isNotBlank()) {
                                 AegisConfig.setDeviceToken(this@AegisForegroundService, token)
                             }
                             sendSnapshot()
+                            ws.send(JSONObject().apply { put("type", "get_peers") }.toString())
                         }
-                        "command" -> handleRemoteCommand(msg)
+                        "mesh_peers" -> {
+                            val selfId = msg.optString("selfId")
+                            if (selfId.isNotBlank()) cloudSelfId = selfId
+                            val arr = msg.optJSONArray("peers") ?: JSONArray()
+                            cloudPeers.clear()
+                            for (i in 0 until arr.length()) {
+                                val p = arr.optJSONObject(i) ?: continue
+                                val pid = p.optString("id")
+                                if (pid.isBlank() || pid == cloudSelfId) continue
+                                cloudPeers[pid] = AegisMeshPeer(
+                                    id = pid,
+                                    name = p.optString("name", pid),
+                                    platform = p.optString("platform", "unknown"),
+                                    lanIp = p.optString("lanIp", ""),
+                                    meshPort = p.optInt("meshPort", AegisConfig.LAN_MESH_PORT),
+                                    status = p.optString("status", "offline"),
+                                    lastSeenMs = System.currentTimeMillis()
+                                )
+                            }
+                        }
+                        "peer_command_result" -> {
+                            val reqId = msg.optString("requestId")
+                            val entry = pendingCloudCmds[reqId]
+                            if (entry != null) {
+                                entry.second[0] = msg
+                                entry.first.countDown()
+                            }
+                        }
+                        "clipboard_sync" -> {
+                            val txt = msg.optString("text", "")
+                            if (txt.isNotBlank()) {
+                                recentClipboard = JSONObject().apply {
+                                    put("fromName", msg.optString("fromName", "Outro Dispositivo"))
+                                    put("text", txt)
+                                    put("transport", "cloud_ws")
+                                    put("receivedAt", System.currentTimeMillis())
+                                }
+                                setAndroidClipboard(this@AegisForegroundService, txt)
+                            }
+                        }
+                        "command", "exec_command" -> handleRemoteCommand(msg)
                     }
                 } catch (_: Exception) {}
             }
@@ -2721,7 +3595,7 @@ class AegisForegroundService : Service() {
         }
     }
 
-    private fun collectTelemetry(): JSONObject {
+    internal fun collectTelemetry(): JSONObject {
         return try {
             val battIntent = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
             val level = battIntent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
@@ -2730,12 +3604,16 @@ class AegisForegroundService : Service() {
             val charging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
                 status == BatteryManager.BATTERY_STATUS_FULL
             val pct = if (level >= 0 && scale > 0) (level * 100) / scale else -1
+            val ips = getLocalIpv4Addresses()
 
             JSONObject().apply {
                 put("manufacturer", Build.MANUFACTURER)
                 put("model", Build.MODEL)
                 put("androidVersion", Build.VERSION.RELEASE)
                 put("sdkInt", Build.VERSION.SDK_INT)
+                put("lanIp", ips.firstOrNull() ?: "")
+                put("lanIps", JSONArray(ips))
+                put("meshPort", AegisConfig.LAN_MESH_PORT)
                 if (pct >= 0) put("batteryPercent", pct)
                 put("charging", charging)
                 put("accessibilityEnabled", AegisAccessibilityService.instance != null)
@@ -2746,7 +3624,7 @@ class AegisForegroundService : Service() {
         }
     }
 
-    private fun collectStorage(): JSONObject {
+    internal fun collectStorage(): JSONObject {
         return try {
             val stat = StatFs(Environment.getDataDirectory().path)
             val totalMb = (stat.blockCountLong * stat.blockSizeLong) / (1024 * 1024)
@@ -2791,7 +3669,7 @@ class AegisForegroundService : Service() {
         return arr
     }
 
-    private fun sendSnapshot() {
+    internal fun sendSnapshot() {
         try {
             val payload = JSONObject().apply {
                 put("type", "snapshot")
@@ -2809,140 +3687,20 @@ class AegisForegroundService : Service() {
         val cmdId = msg.optString("commandId")
         val cmdType = msg.optString("commandType")
         val payload = msg.optJSONObject("payload") ?: JSONObject()
-
-        var ok = true
-        val output = JSONObject()
-
-        try {
-            when (cmdType) {
-                "telemetry" -> {
-                    output.put("telemetry", collectTelemetry())
-                    output.put("storage", collectStorage())
-                    sendSnapshot()
-                }
-                "list_files" -> {
-                    val target = payload.optString("path", Environment.getExternalStorageDirectory().absolutePath)
-                    val dir = File(target)
-                    val entries = JSONArray()
-                    dir.listFiles()?.sortedBy { it.name }?.take(150)?.forEach { f ->
-                        entries.put(JSONObject().apply {
-                            put("name", f.name)
-                            put("path", f.absolutePath)
-                            put("type", if (f.isDirectory) "directory" else "file")
-                            put("size", f.length())
-                        })
-                    }
-                    output.put("path", dir.absolutePath)
-                    output.put("entries", entries)
-                }
-                "read_file" -> {
-                    val fp = payload.optString("path", "")
-                    val f = File(fp)
-                    if (!f.exists() || !f.isFile) {
-                        ok = false
-                        output.put("error", "Arquivo nao encontrado: " + fp)
-                    } else {
-                        output.put("path", f.absolutePath)
-                        output.put("content", f.readText().take(20_000))
-                    }
-                }
-                "list_apps" -> {
-                    output.put("apps", collectInstalledApps())
-                }
-                "open_app" -> {
-                    val pkg = payload.optString("package", "")
-                    val launch = packageManager.getLaunchIntentForPackage(pkg)
-                    if (launch != null) {
-                        launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        startActivity(launch)
-                        output.put("launched", pkg)
-                    } else {
-                        ok = false
-                        output.put("error", "Pacote nao encontrado: " + pkg)
-                    }
-                }
-                "tap" -> {
-                    val acc = AegisAccessibilityService.instance
-                    if (acc == null) {
-                        ok = false
-                        output.put("error", "Ative AegisAccessibilityService nas configuracoes do Android.")
-                    } else {
-                        val x = payload.optDouble("x", 540.0).toFloat()
-                        val y = payload.optDouble("y", 1200.0).toFloat()
-                        acc.performTap(x, y)
-                        output.put("tapped", x.toString() + "," + y.toString())
-                    }
-                }
-                "swipe" -> {
-                    val acc = AegisAccessibilityService.instance
-                    if (acc == null) {
-                        ok = false
-                        output.put("error", "Ative AegisAccessibilityService nas configuracoes do Android.")
-                    } else {
-                        acc.performSwipe(
-                            payload.optDouble("x1", 500.0).toFloat(),
-                            payload.optDouble("y1", 1500.0).toFloat(),
-                            payload.optDouble("x2", 500.0).toFloat(),
-                            payload.optDouble("y2", 500.0).toFloat()
-                        )
-                        output.put("swiped", true)
-                    }
-                }
-                "keyevent" -> {
-                    val acc = AegisAccessibilityService.instance
-                    val key = payload.optString("key", "HOME")
-                    if (acc != null) {
-                        acc.performGlobalKey(key)
-                        output.put("key", key)
-                    } else {
-                        ok = false
-                        output.put("error", "Ative AegisAccessibilityService nas configuracoes do Android.")
-                    }
-                }
-                "ui_dump" -> {
-                    val acc = AegisAccessibilityService.instance
-                    if (acc != null) {
-                        output.put("nodes", acc.dumpScreenNodes())
-                    } else {
-                        ok = false
-                        output.put("error", "Ative AegisAccessibilityService nas configuracoes do Android.")
-                    }
-                }
-                "notify" -> {
-                    val title = payload.optString("title", "Aegis")
-                    val text = payload.optString("text", "")
-                    val nm = getSystemService(NotificationManager::class.java)
-                    nm?.notify(
-                        (System.currentTimeMillis() % 10000).toInt(),
-                        NotificationCompat.Builder(this, "aegis_native_agent")
-                            .setContentTitle(title)
-                            .setContentText(text)
-                            .setSmallIcon(android.R.drawable.ic_dialog_info)
-                            .build()
-                    )
-                    output.put("notified", true)
-                }
-                else -> {
-                    ok = false
-                    output.put("error", "Comando nao suportado no app nativo: " + cmdType)
-                }
-            }
-        } catch (e: Exception) {
-            ok = false
-            output.put("error", e.message ?: "Erro ao executar comando no Android")
-        }
-
+        val result = executeLocalAndroidCommand(this, cmdType, payload, "Aegis Cloud Mesh")
         val reply = JSONObject().apply {
             put("type", "command_result")
             put("commandId", cmdId)
-            put("ok", ok)
-            put("output", output)
+            put("ok", result.optBoolean("ok"))
+            put("output", result.optJSONObject("output") ?: JSONObject())
+            if (!result.optBoolean("ok")) put("error", result.optString("error"))
         }
         webSocket?.send(reply.toString())
     }
 
     override fun onDestroy() {
         isRunning = false
+        activeInstance = null
         connectionState = "stopped"
         serviceJob.cancel()
         webSocket?.close(1000, "destroyed")
@@ -3370,6 +4128,131 @@ async function fetchGithubReleaseArtifacts(
     clearTimeout(timer);
 
     if (res.status === 404) {
+      // Fallback: check if GitHub Actions already compiled artifacts (e.g., Android APK & Linux Electron AppImage)
+      try {
+        const runsRes = await fetch(`https://api.github.com/repos/${repo}/actions/runs?per_page=5`, {
+          headers,
+        });
+        if (runsRes.ok) {
+          const runsJson = (await runsRes.json()) as {
+            workflow_runs?: Array<{ id: number; html_url: string; created_at: string; head_sha?: string }>;
+          };
+          for (const run of runsJson.workflow_runs || []) {
+            const artRes = await fetch(`https://api.github.com/repos/${repo}/actions/runs/${run.id}/artifacts`, {
+              headers,
+            });
+            if (!artRes.ok) continue;
+            const artJson = (await artRes.json()) as {
+              artifacts?: Array<{ id: number; name: string; size_in_bytes: number; expired: boolean; created_at: string }>;
+            };
+            const validArts = (artJson.artifacts || []).filter((a) => !a.expired);
+            if (validArts.length === 0) continue;
+
+            const actionMapped: NativeArtifactMeta[] = [];
+            for (const a of validArts) {
+              const lower = a.name.toLowerCase();
+              const artifactUrl = `https://github.com/${repo}/actions/runs/${run.id}/artifacts/${a.id}`;
+              if (lower.includes('android')) {
+                actionMapped.push({
+                  id: `gha-android-${a.id}`,
+                  os: 'android',
+                  filename: `AegisAndroid-${APP_VERSION}.apk`,
+                  title: `Aegis Android — APK Compilado (GitHub Actions #${run.id})`,
+                  subtitle: `APK nativo compilado com sucesso no GitHub Actions (${repo}) — pronto para instalar direto no Android`,
+                  format: '.apk (Android Compilado)',
+                  architecture: 'Android 8.0+ (arm64 / universal)',
+                  downloadUrl: artifactUrl,
+                  sizeBytes: Number.isFinite(a.size_in_bytes) ? a.size_in_bytes : null,
+                  sha256: null,
+                  compiledOnServer: true,
+                  source: 'github_release',
+                  releaseTag: `Actions #${run.id}`,
+                  installSteps: [
+                    `Clique em "Baixar AegisAndroid-${APP_VERSION}.apk" para baixar o artefato compilado do GitHub Actions`,
+                    'Descompacte o ZIP do Actions (contém AegisAndroid-2.1.0.apk) e transfira/abra no celular Android',
+                    'Permita "Instalar apps desconhecidos", abra o Aegis Android e ative Acessibilidade + Notificações',
+                  ],
+                  capabilities: [
+                    'Binário .APK nativo compilado com sucesso pelo Gradle 8.10 + JDK 17',
+                    'HUD Holográfica 3D embarcada + ponte Android + conexão Google Workspace',
+                    `Compilação verificada na execução Actions #${run.id} de ${repo}`,
+                  ],
+                });
+              } else if (lower.includes('linux')) {
+                actionMapped.push({
+                  id: `gha-linux-${a.id}`,
+                  os: 'linux',
+                  filename: `AegisDesktop-Electron-${APP_VERSION}.AppImage`,
+                  title: `Aegis Desktop Linux — Pacote Completo + Electron AppImage (Actions #${run.id})`,
+                  subtitle: `Inclui .deb, .AppImage portátil, Electron AppImage, .tar.gz e ELF compilados em ${repo}`,
+                  format: '.AppImage + .deb (Compilado)',
+                  architecture: 'x86_64',
+                  downloadUrl: artifactUrl,
+                  sizeBytes: Number.isFinite(a.size_in_bytes) ? a.size_in_bytes : null,
+                  sha256: null,
+                  compiledOnServer: true,
+                  source: 'github_release',
+                  releaseTag: `Actions #${run.id}`,
+                  installSteps: [
+                    'Baixe o pacote compilado do GitHub Actions e extraia os binários Linux',
+                    `chmod +x AegisDesktop-Electron-${APP_VERSION}.AppImage && ./AegisDesktop-Electron-${APP_VERSION}.AppImage`,
+                    `Ou instale via Debian/Ubuntu: sudo apt install ./aegis-desktop_${APP_VERSION}_amd64.deb`,
+                  ],
+                  capabilities: [
+                    'Inclui janela desktop Electron nativa (.AppImage) + pacote .deb + ELF compilados',
+                    'HUD Holográfica 3D + Subagentes Flash Lite → Curador + 2º Plano + Google Workspace',
+                    `Compilação verificada na execução Actions #${run.id} de ${repo}`,
+                  ],
+                });
+              } else if (lower.includes('windows')) {
+                actionMapped.push({
+                  id: `gha-windows-${a.id}`,
+                  os: 'windows',
+                  filename: `AegisDesktop-${APP_VERSION}.exe`,
+                  title: `Aegis Desktop Windows — Executável Compilado (Actions #${run.id})`,
+                  subtitle: `Executável nativo Windows compilado no GitHub Actions (${repo})`,
+                  format: '.exe (Win64 Compilado)',
+                  architecture: 'x64 (Windows 10/11)',
+                  downloadUrl: artifactUrl,
+                  sizeBytes: Number.isFinite(a.size_in_bytes) ? a.size_in_bytes : null,
+                  sha256: null,
+                  compiledOnServer: true,
+                  source: 'github_release',
+                  releaseTag: `Actions #${run.id}`,
+                  installSteps: [
+                    'Baixe o artefato Windows compilado do GitHub Actions e extraia o .exe',
+                    `Execute AegisDesktop-${APP_VERSION}.exe (ou Setup .exe) no Windows 10/11`,
+                  ],
+                  capabilities: [
+                    'Binário Windows compilado pronto para executar',
+                    `Compilação verificada na execução Actions #${run.id} de ${repo}`,
+                  ],
+                });
+              }
+            }
+
+            if (actionMapped.length > 0) {
+              const result = {
+                sync: {
+                  repo,
+                  status: 'linked' as const,
+                  releaseTag: `Actions #${run.id}`,
+                  releaseUrl: run.html_url || `https://github.com/${repo}/actions/runs/${run.id}`,
+                  publishedAt: run.created_at || null,
+                  syncedAssetsCount: actionMapped.length,
+                  message: `${actionMapped.length} build(s) compilado(s) do GitHub Actions (#${run.id}) vinculados diretamente aos botões de download! Rode o workflow atualizado para publicar também o Windows .exe e a Release pública.`,
+                },
+                artifacts: actionMapped,
+              };
+              githubReleaseCache.set(repo, { fetchedAt: Date.now(), ...result });
+              return result;
+            }
+          }
+        }
+      } catch {
+        // Fall through to default no_releases status
+      }
+
       const result = {
         sync: {
           repo,

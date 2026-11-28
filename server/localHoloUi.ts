@@ -1064,6 +1064,9 @@ export function getLocalHoloUiHtml(options?: LocalHoloUiOptions): string {
     memoryData: { facts: [], recent: [] },
     adbDevices: [],
     adbOutput: '',
+    meshStatus: null,
+    meshOutput: '',
+    meshScanning: false,
     settingsTab: 'google',
     workspaceSubTab: 'drive',
     driveFolderId: 'root',
@@ -1876,7 +1879,10 @@ export function getLocalHoloUiHtml(options?: LocalHoloUiOptions): string {
     if (id === 'terminal' && !state.filesList.length) loadLocalFiles('');
     if (id === 'web') loadCredentials();
     if (id === 'memory') loadMemory();
-    if (id === 'devices' && !IS_ANDROID_BRIDGE) loadAdbDevices();
+    if (id === 'devices') {
+      loadMeshStatus();
+      if (!IS_ANDROID_BRIDGE) loadAdbDevices();
+    }
     if (id === 'settings') {
       refreshStatusAndGoogle().then(function() {
         if (state.googleSync && state.googleSync.connected && !state.driveItems.length) {
@@ -2482,18 +2488,108 @@ export function getLocalHoloUiHtml(options?: LocalHoloUiOptions): string {
     } catch (e) { toast(e.message); }
   };
 
+  function fmtMeshTransportTag(tr) {
+    if (tr === 'lan_p2p') return '<span class="tag emerald">Wi-Fi/LAN P2P</span>';
+    if (tr === 'cloud_ws') return '<span class="tag cyan">Nuvem WS</span>';
+    if (tr === 'adb_wifi') return '<span class="tag amber">ADB Wi-Fi</span>';
+    if (tr === 'adb_usb') return '<span class="tag amber">ADB USB</span>';
+    return '<span class="tag">' + esc(tr) + '</span>';
+  }
+
   function renderDevicesModule(body) {
+    var m = state.meshStatus;
+    if (!m && IS_ANDROID_BRIDGE && window.AegisAndroid && window.AegisAndroid.getMeshStatusJson) {
+      try { m = JSON.parse(window.AegisAndroid.getMeshStatusJson() || '{}'); state.meshStatus = m; } catch (e) {}
+    }
+    var tr = (m && m.transports) || {};
+    var lanIps = (m && Array.isArray(m.lanIps) && m.lanIps.length) ? m.lanIps.join(', ') : 'Aguardando rede...';
+    var peers = (m && Array.isArray(m.peers)) ? m.peers : [];
+    var secSource = (m && m.meshSecretSource) || 'none';
+    var cloudOk = tr.cloudWs === 'online';
+
+    var html = '<div class="spatial-card" style="padding:16px;display:flex;flex-direction:column;gap:12px;">'
+      + '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">'
+      + '<div><div style="font-size:14px;font-weight:700;color:#fff;">Malha Automática Multi-Conexão</div>'
+      + '<div style="font-size:11.5px;color:var(--muted);">Descoberta automática sem cabo (Wi-Fi/LAN P2P + Nuvem WebSocket + Auto-Pareamento Google + ADB USB/Wi-Fi)</div></div>'
+      + '<button class="btn sm primary" onclick="scanMeshAll()" ' + (state.meshScanning ? 'disabled' : '') + '>' + ICONS.refresh + (state.meshScanning ? ' Escaneando...' : ' Escanear Malha') + '</button>'
+      + '</div>'
+      + '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">'
+      + '<span class="tag ' + (tr.lanDiscovery ? 'emerald' : 'amber') + '">LAN UDP :' + esc((m && m.lanDiscoveryPort) || 38471) + ' · ' + (tr.lanDiscovery ? 'Ativo' : 'Standby') + '</span>'
+      + '<span class="tag ' + (tr.lanP2p ? 'emerald' : 'amber') + '">P2P Direto :' + esc((m && m.lanMeshPort) || 38472) + ' · ' + (tr.lanP2p ? 'HMAC-SHA256' : 'Standby') + '</span>'
+      + '<span class="tag ' + (cloudOk ? 'cyan' : 'amber') + '">Nuvem WS · ' + esc(tr.cloudWs || 'idle') + '</span>'
+      + (!IS_ANDROID_BRIDGE ? '<span class="tag amber">ADB USB/Wi-Fi · ' + esc(tr.adbCount || state.adbDevices.length) + '</span>' : '')
+      + '<span class="tag mono">IP Local: ' + esc(lanIps) + '</span>'
+      + '</div>';
+
+    if (!peers.length) {
+      html += '<div style="font-size:12px;color:var(--muted);padding:12px;border-radius:12px;background:rgba(255,255,255,0.03);line-height:1.5;">'
+        + 'Nenhum outro dispositivo Aegis detectado ainda. Abra o Aegis no celular Android, Linux ou Windows na mesma rede Wi-Fi (descoberta automática instantânea) ou conecte ambos à mesma conta Google / Aegis Cloud.'
+        + '</div>';
+    } else {
+      for (var pi = 0; pi < peers.length; pi++) {
+        var p = peers[pi];
+        var pTransports = Array.isArray(p.transports) ? p.transports : [];
+        var trHtml = '';
+        for (var ti = 0; ti < pTransports.length; ti++) trHtml += fmtMeshTransportTag(pTransports[ti]) + ' ';
+        var defaultPath = p.platform === 'android' ? '/sdcard' : '.';
+        html += '<div class="spatial-card" style="padding:12px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">'
+          + '<div style="min-width:180px;">'
+          + '<div style="font-size:13px;font-weight:700;color:#fff;display:flex;align-items:center;gap:6px;flex-wrap:wrap;">'
+          + '<span>' + esc(p.name || p.id) + '</span>'
+          + '<span class="tag mono">' + esc(String(p.platform || 'device').toUpperCase()) + '</span>'
+          + '</div>'
+          + '<div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:5px;">' + trHtml
+          + (p.lanIp ? '<span class="tag mono">' + esc(p.lanIp) + '</span>' : '')
+          + '</div></div>'
+          + '<div style="display:flex;gap:6px;flex-wrap:wrap;">'
+          + '<button class="btn sm cyan" onclick="runMeshPeerCmd(\\'' + esc(p.id) + '\\', \\'ping\\', {})">Ping Auto</button>'
+          + '<button class="btn sm" onclick="runMeshPeerCmd(\\'' + esc(p.id) + '\\', \\'telemetry\\', {})">Telemetria</button>'
+          + '<button class="btn sm" onclick="runMeshPeerCmd(\\'' + esc(p.id) + '\\', \\'list_files\\', { path: \\'' + esc(defaultPath) + '\\' })">Arquivos</button>'
+          + '</div></div>';
+      }
+    }
+
+    html += '<div class="grid-2" style="margin-top:4px;">'
+      + '<div style="padding:12px;border-radius:12px;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.07);display:flex;flex-direction:column;gap:8px;">'
+      + '<div style="font-size:12px;font-weight:700;color:#fff;">Área de Transferência Multi-Dispositivo</div>'
+      + '<div style="display:flex;gap:6px;">'
+      + '<input id="mesh-clip-inp" class="inp" placeholder="Texto ou link para enviar a todos os aparelhos..." />'
+      + '<button class="btn sm primary" onclick="sendMeshClipboard()">Enviar</button>'
+      + '</div>';
+    if (m && m.recentClipboard && m.recentClipboard.text) {
+      html += '<div style="font-size:11px;color:var(--emerald);display:flex;align-items:center;justify-content:space-between;gap:8px;background:rgba(16,185,129,0.08);padding:7px 9px;border-radius:9px;">'
+        + '<span class="mono" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">De ' + esc(m.recentClipboard.fromName || 'Peer') + ': ' + esc(String(m.recentClipboard.text).slice(0, 70)) + '</span>'
+        + '<button class="btn sm" onclick="copyMeshClipboard()">Copiar</button>'
+        + '</div>';
+    }
+    html += '</div>'
+      + '<div style="padding:12px;border-radius:12px;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.07);display:flex;flex-direction:column;gap:8px;">'
+      + '<div style="display:flex;align-items:center;justify-content:space-between;gap:6px;">'
+      + '<div style="font-size:12px;font-weight:700;color:#fff;">Chave de Malha LAN (HMAC-SHA256)</div>'
+      + '<span class="tag ' + (secSource !== 'none' ? 'emerald' : 'amber') + '">'
+      + (secSource === 'custom_key' ? 'Chave Definida' : (secSource === 'google_account' ? 'Auto via Google' : 'Somente Descoberta'))
+      + '</span></div>'
+      + '<div style="display:flex;gap:6px;">'
+      + '<input id="mesh-key-inp" type="password" class="inp" placeholder="Use a mesma senha no PC e no Android (offline)..." />'
+      + '<button class="btn sm emerald" onclick="saveMeshKeyConfig()">Salvar</button>'
+      + '</div></div></div>';
+
+    if (state.meshOutput) {
+      html += '<pre class="mono" style="font-size:11.5px;background:rgba(0,0,0,0.45);padding:12px;border-radius:12px;max-height:220px;overflow:auto;color:var(--cyan);">' + esc(state.meshOutput) + '</pre>';
+    }
+    html += '</div>';
+
     if (IS_ANDROID_BRIDGE) {
       var stJson = {};
       try { stJson = JSON.parse(window.AegisAndroid.getStatusJson() || '{}'); } catch (e) {}
-      body.innerHTML = '<div class="spatial-card" style="padding:16px;display:flex;flex-direction:column;gap:12px;">'
+      html += '<div class="spatial-card" style="padding:16px;display:flex;flex-direction:column;gap:12px;margin-top:12px;">'
         + '<div style="display:flex;align-items:center;justify-content:space-between;">'
-        + '<div><div style="font-size:14px;font-weight:700;color:#fff;">Agente Android Nativo (24/7)</div>'
-        + '<div style="font-size:11.5px;color:var(--muted);">Conecte à sua instância Aegis Cloud para controle completo + Google Workspace</div></div>'
+        + '<div><div style="font-size:14px;font-weight:700;color:#fff;">Agente Android Nativo (Nuvem 24/7)</div>'
+        + '<div style="font-size:11.5px;color:var(--muted);">Conecte à sua instância Aegis Cloud para acesso fora do Wi-Fi + Google Workspace</div></div>'
         + '<span class="tag ' + (stJson.serviceRunning ? 'emerald' : 'amber') + '">' + (stJson.serviceRunning ? 'Serviço Ativo' : 'Parado') + '</span>'
         + '</div>'
         + '<div class="grid-2">'
-        + '<div><label style="font-size:11px;color:var(--muted);">URL do Aegis Cloud</label><input id="and-origin" class="inp" value="' + esc(stJson.origin || state.cloudOrigin) + '" /></div>'
+        + '<div><label style="font-size:11px;color:var(--muted);">URL do Aegis Cloud</label><input id="and-origin" class="inp" value="' + esc(stJson.serverOrigin || stJson.origin || state.cloudOrigin) + '" /></div>'
         + '<div><label style="font-size:11px;color:var(--muted);">Código de Pareamento</label><input id="and-code" class="inp" placeholder="AEGIS-XXXX" value="' + esc(stJson.pairingCode || '') + '" /></div>'
         + '</div>'
         + '<div style="display:flex;gap:8px;flex-wrap:wrap;">'
@@ -2501,25 +2597,26 @@ export function getLocalHoloUiHtml(options?: LocalHoloUiOptions): string {
         + '<button class="btn danger" onclick="window.AegisAndroid.stopService(); renderModuleContent();">Parar Serviço</button>'
         + '<button class="btn cyan" onclick="window.AegisAndroid.openRemoteHud(document.getElementById(\\'and-origin\\').value)">Abrir HUD Web + Google</button>'
         + '</div></div>'
-        + '<div class="spatial-card" style="padding:16px;"><div style="font-size:13px;font-weight:700;color:#fff;margin-bottom:10px;">Permissões Nativas do Sistema Android</div>'
+        + '<div class="spatial-card" style="padding:16px;margin-top:12px;"><div style="font-size:13px;font-weight:700;color:#fff;margin-bottom:10px;">Permissões Nativas do Sistema Android</div>'
         + '<div class="grid-2">'
         + '<button class="btn" onclick="window.AegisAndroid.openAccessibilitySettings()">Acessibilidade (Automação de Tela)</button>'
         + '<button class="btn" onclick="window.AegisAndroid.openNotificationSettings()">Leitura de Notificações</button>'
         + '<button class="btn" onclick="window.AegisAndroid.openFilesPermission()">Acesso a Arquivos (/sdcard)</button>'
         + '<button class="btn" onclick="window.AegisAndroid.openBatterySettings()">Ignorar Otimização de Bateria</button>'
         + '</div></div>';
+      body.innerHTML = html;
       return;
     }
 
-    var html = '<div class="spatial-card" style="padding:16px;display:flex;flex-direction:column;gap:12px;">'
+    html += '<div class="spatial-card" style="padding:16px;display:flex;flex-direction:column;gap:12px;margin-top:12px;">'
       + '<div style="display:flex;align-items:center;justify-content:space-between;">'
-      + '<div><div style="font-size:14px;font-weight:700;color:#fff;">Ponte ADB para Android (USB / Wi-Fi)</div>'
-      + '<div style="font-size:11.5px;color:var(--muted);">Controle celulares Android conectados diretamente a esta máquina</div></div>'
+      + '<div><div style="font-size:14px;font-weight:700;color:#fff;">Ponte ADB para Android (USB + Wireless mDNS)</div>'
+      + '<div style="font-size:11.5px;color:var(--muted);">Complemento de baixo nível para celulares Android via cabo USB ou Depuração Sem Fio</div></div>'
       + '<button class="btn sm" onclick="loadAdbDevices()">' + ICONS.refresh + ' Escanear ADB</button>'
       + '</div>';
 
     if (!state.adbDevices.length) {
-      html += '<div style="font-size:12px;color:var(--muted);padding:10px;border-radius:12px;background:rgba(255,255,255,0.03);">Nenhum dispositivo Android ADB detectado. Ative a Depuração USB e conecte o cabo.</div>';
+      html += '<div style="font-size:12px;color:var(--muted);padding:10px;border-radius:12px;background:rgba(255,255,255,0.03);">Nenhum dispositivo Android ADB detectado. Você pode usar a Malha Wi-Fi/LAN ou Nuvem acima sem cabo!</div>';
     } else {
       for (var i = 0; i < state.adbDevices.length; i++) {
         var d = state.adbDevices[i];
@@ -2540,6 +2637,101 @@ export function getLocalHoloUiHtml(options?: LocalHoloUiOptions): string {
     body.innerHTML = html;
   }
 
+  window.loadMeshStatus = async function() {
+    try {
+      if (IS_ANDROID_BRIDGE && window.AegisAndroid && window.AegisAndroid.getMeshStatusJson) {
+        state.meshStatus = JSON.parse(window.AegisAndroid.getMeshStatusJson() || '{}');
+      } else if (!IS_ANDROID_BRIDGE) {
+        state.meshStatus = await api('/mesh/status');
+      }
+      if (state.activeModule === 'devices') renderModuleContent();
+    } catch (e) {}
+  };
+
+  window.scanMeshAll = async function() {
+    state.meshScanning = true;
+    if (state.activeModule === 'devices') renderModuleContent();
+    try {
+      if (IS_ANDROID_BRIDGE && window.AegisAndroid && window.AegisAndroid.scanLanMesh) {
+        state.meshStatus = JSON.parse(window.AegisAndroid.scanLanMesh() || '{}');
+      } else if (!IS_ANDROID_BRIDGE) {
+        state.meshStatus = await api('/mesh/scan', { method: 'POST', body: {} });
+        await loadAdbDevices();
+      }
+      toast('Malha escaneada: ' + ((state.meshStatus && state.meshStatus.peers) ? state.meshStatus.peers.length : 0) + ' dispositivo(s) encontrado(s).');
+    } catch (e) {
+      toast('Erro ao escanear malha: ' + e.message);
+    } finally {
+      state.meshScanning = false;
+      if (state.activeModule === 'devices') renderModuleContent();
+    }
+  };
+
+  window.saveMeshKeyConfig = async function() {
+    var inp = document.getElementById('mesh-key-inp');
+    var key = inp ? inp.value.trim() : '';
+    try {
+      if (IS_ANDROID_BRIDGE && window.AegisAndroid && window.AegisAndroid.setMeshKey) {
+        state.meshStatus = JSON.parse(window.AegisAndroid.setMeshKey(key) || '{}');
+      } else {
+        state.meshStatus = await api('/mesh/config', { method: 'POST', body: { meshKey: key } });
+      }
+      if (inp) inp.value = '';
+      toast(key ? 'Chave de Malha LAN salva (HMAC-SHA256 ativo).' : 'Chave personalizada limpa.');
+      if (state.activeModule === 'devices') renderModuleContent();
+    } catch (e) { toast(e.message); }
+  };
+
+  window.runMeshPeerCmd = async function(peerId, commandType, payload) {
+    try {
+      toast('Roteando comando (' + commandType + ') pela melhor conexão...');
+      var res;
+      if (IS_ANDROID_BRIDGE && window.AegisAndroid && window.AegisAndroid.execPeerCommandJson) {
+        res = JSON.parse(window.AegisAndroid.execPeerCommandJson(peerId, commandType, JSON.stringify(payload || {})) || '{}');
+      } else {
+        res = await api('/mesh/exec', { method: 'POST', body: { peerId: peerId, commandType: commandType, payload: payload || {} } });
+      }
+      state.meshOutput = JSON.stringify(res, null, 2);
+      if (res && res.ok) {
+        toast('Executado via ' + (res.transportUsed || 'auto') + '!');
+      } else {
+        toast((res && res.error) || 'Falha no comando remoto.');
+      }
+      if (state.activeModule === 'devices') renderModuleContent();
+    } catch (e) {
+      state.meshOutput = 'Erro: ' + e.message;
+      toast(e.message);
+      if (state.activeModule === 'devices') renderModuleContent();
+    }
+  };
+
+  window.sendMeshClipboard = async function() {
+    var inp = document.getElementById('mesh-clip-inp');
+    var txt = inp ? inp.value.trim() : '';
+    if (!txt) return;
+    try {
+      var res;
+      if (IS_ANDROID_BRIDGE && window.AegisAndroid && window.AegisAndroid.syncClipboardToMesh) {
+        res = JSON.parse(window.AegisAndroid.syncClipboardToMesh(txt) || '{}');
+        state.meshStatus = JSON.parse(window.AegisAndroid.getMeshStatusJson() || '{}');
+      } else {
+        res = await api('/mesh/clipboard', { method: 'POST', body: { text: txt } });
+        state.meshStatus = res;
+      }
+      if (inp) inp.value = '';
+      toast('Área de transferência sincronizada (' + (res.delivered || 0) + ' canal/is).');
+      if (state.activeModule === 'devices') renderModuleContent();
+    } catch (e) { toast(e.message); }
+  };
+
+  window.copyMeshClipboard = function() {
+    var txt = state.meshStatus && state.meshStatus.recentClipboard && state.meshStatus.recentClipboard.text;
+    if (!txt) return;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(txt).then(function() { toast('Copiado para área de transferência!'); }).catch(function() {});
+    }
+  };
+
   window.androidStartBridge = function() {
     if (!IS_ANDROID_BRIDGE) return;
     var origin = document.getElementById('and-origin').value.trim();
@@ -2547,6 +2739,7 @@ export function getLocalHoloUiHtml(options?: LocalHoloUiOptions): string {
     try {
       var res = JSON.parse(window.AegisAndroid.connectAndStart(origin, code) || '{}');
       toast(res.message || (res.ok ? 'Conectado!' : 'Erro ao conectar'));
+      loadMeshStatus();
       renderModuleContent();
     } catch (e) { toast('Falha: ' + e.message); }
   };
