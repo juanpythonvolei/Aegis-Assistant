@@ -9,6 +9,7 @@ coverage/
 .env*
 !.env.example
 data/
+linux_workspace/
 *.db
 *.db-wal
 *.db-shm
