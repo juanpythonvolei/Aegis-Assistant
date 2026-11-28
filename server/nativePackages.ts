@@ -2767,7 +2767,11 @@ class MainActivity : AppCompatActivity() {
                     put("biometricEnabled", bioAvail && AegisConfig.isBiometricEnabled(this@MainActivity))
                 }.toString()
             } catch (_: Exception) {
-                "{\"needsSetup\":true,\"biometricAvailable\":false,\"biometricEnabled\":false}"
+                JSONObject().apply {
+                    put("needsSetup", true)
+                    put("biometricAvailable", false)
+                    put("biometricEnabled", false)
+                }.toString()
             }
         }
 
@@ -2833,7 +2837,9 @@ class MainActivity : AppCompatActivity() {
                     put("serverOrigin", AegisConfig.getServerOrigin(this@MainActivity))
                 }.toString()
             } catch (_: Exception) {
-                "{\"connected\":false}"
+                JSONObject().apply {
+                    put("connected", false)
+                }.toString()
             }
         }
 
