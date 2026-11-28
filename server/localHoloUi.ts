@@ -894,7 +894,7 @@ export function getLocalHoloUiHtml(options?: LocalHoloUiOptions): string {
       <div style="display:flex;align-items:center;gap:12px;margin-bottom:18px;">
         <div class="brand-orb" id="auth-brand-ico" style="width:44px;height:44px;"></div>
         <div>
-          <div style="font-size:17px;font-weight:800;letter-spacing:0.05em;color:#fff;">AEGIS LOCAL</div>
+          <div id="auth-title" style="font-size:17px;font-weight:800;letter-spacing:0.05em;color:#fff;">AEGIS LOCAL</div>
           <div id="auth-subtitle" style="font-size:12px;color:var(--amber-soft);">Autenticação criptografada do operador</div>
         </div>
       </div>
@@ -907,10 +907,18 @@ export function getLocalHoloUiHtml(options?: LocalHoloUiOptions): string {
           <label style="display:block;font-size:11.5px;color:var(--muted);margin-bottom:5px;">Senha</label>
           <input id="auth-pass" class="inp" type="password" required placeholder="Mínimo 4 caracteres" autocomplete="current-password" />
         </div>
+        <label id="auth-bio-wrap" style="display:none;align-items:center;gap:9px;font-size:12px;color:#e2e8f0;padding:9px 11px;border-radius:11px;background:rgba(56,189,248,0.08);border:1px solid rgba(56,189,248,0.25);cursor:pointer;">
+          <input id="auth-bio-check" type="checkbox" checked style="width:16px;height:16px;accent-color:#38bdf8;" />
+          <span>Habilitar desbloqueio por impressão digital</span>
+        </label>
         <div id="auth-error" style="display:none;font-size:12px;color:var(--rose);padding:8px 10px;border-radius:10px;background:var(--rose-dim);border:1px solid rgba(251,113,133,0.3);"></div>
         <button type="submit" id="auth-submit-btn" class="btn primary" style="width:100%;padding:11px;">Entrar no Núcleo</button>
       </form>
-      <div style="margin-top:14px;font-size:11px;color:var(--muted);line-height:1.45;">
+      <button type="button" id="auth-bio-btn" class="btn cyan" onclick="triggerAndroidBiometric()" style="display:none;width:100%;padding:11px;margin-top:10px;justify-content:center;">
+        <span id="auth-bio-ico-slot"></span>
+        <span>Desbloquear com Impressão Digital</span>
+      </button>
+      <div id="auth-footer" style="margin-top:14px;font-size:11px;color:var(--muted);line-height:1.45;">
         Execução 100% local em <span class="mono" style="color:var(--amber-soft);">127.0.0.1:3847</span> com cofre AES-256-GCM e sincronização opcional com Google Workspace.
       </div>
     </div>
@@ -980,6 +988,7 @@ export function getLocalHoloUiHtml(options?: LocalHoloUiOptions): string {
     refresh: '<svg class="svg-ico sm" viewBox="0 0 24 24"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg>',
     logout: '<svg class="svg-ico sm" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>',
     trash: '<svg class="svg-ico sm" viewBox="0 0 24 24"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>',
+    fingerprint: '<svg class="svg-ico" viewBox="0 0 24 24"><path d="M12 10a2 2 0 0 0-2 2c0 1.02-.1 2.51-.26 4"/><path d="M14 13.12c0 2.38 0 6.38-1 8.88"/><path d="M17.29 21.02c.12-.6.43-2.3.5-3.02"/><path d="M2 12a10 10 0 0 1 18-6"/><path d="M2 16h.01"/><path d="M21.8 16c.2-2 .131-5.354 0-6"/><path d="M5 19.5C5.5 18 6 15 6 12a6 6 0 0 1 .34-2"/><path d="M8.65 22c.21-.66.45-1.32.57-2"/><path d="M9 6.8a6 6 0 0 1 9 5.2v2"/></svg>',
     googleG: '<svg width="18" height="18" viewBox="0 0 48 48" style="flex-shrink:0;"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>'
   };
 
@@ -1017,7 +1026,9 @@ export function getLocalHoloUiHtml(options?: LocalHoloUiOptions): string {
     token: localStorage.getItem('aegis_local_token') || '',
     username: '',
     needsSetup: false,
-    authenticated: IS_ANDROID_BRIDGE,
+    authenticated: false,
+    biometricAvailable: false,
+    biometricEnabled: false,
     activeModule: null,
     activePopover: null,
     drawerOpen: false,
@@ -1374,6 +1385,8 @@ export function getLocalHoloUiHtml(options?: LocalHoloUiOptions): string {
     document.getElementById('send-ico-slot').innerHTML = ICONS.send;
     document.getElementById('auth-brand-ico').innerHTML = ICONS.shield;
     document.getElementById('confirm-ico-slot').innerHTML = ICONS.shield;
+    var bioIco = document.getElementById('auth-bio-ico-slot');
+    if (bioIco) bioIco.innerHTML = ICONS.fingerprint;
   }
 
   // ===== Core State & Topbar Sync =====
@@ -1696,21 +1709,25 @@ export function getLocalHoloUiHtml(options?: LocalHoloUiOptions): string {
       + '</div>';
 
     if (connected) {
-      html += '<div class="grid-4" style="gap:7px;">'
-        + '<div style="padding:7px;border-radius:10px;background:rgba(255,255,255,0.03);text-align:center;"><div class="mono" style="font-size:14px;font-weight:700;color:#fff;">' + counts.drive + '</div><div style="font-size:10px;color:var(--muted);">Drive</div></div>'
-        + '<div style="padding:7px;border-radius:10px;background:rgba(255,255,255,0.03);text-align:center;"><div class="mono" style="font-size:14px;font-weight:700;color:#fff;">' + counts.gmail + '</div><div style="font-size:10px;color:var(--muted);">Gmail</div></div>'
-        + '<div style="padding:7px;border-radius:10px;background:rgba(255,255,255,0.03);text-align:center;"><div class="mono" style="font-size:14px;font-weight:700;color:#fff;">' + counts.calendar + '</div><div style="font-size:10px;color:var(--muted);">Agenda</div></div>'
-        + '<div style="padding:7px;border-radius:10px;background:rgba(255,255,255,0.03);text-align:center;"><div class="mono" style="font-size:14px;font-weight:700;color:#fff;">' + counts.tasks + '</div><div style="font-size:10px;color:var(--muted);">Tarefas</div></div>'
-        + '</div>';
+      if (!IS_ANDROID_BRIDGE) {
+        html += '<div class="grid-4" style="gap:7px;">'
+          + '<div style="padding:7px;border-radius:10px;background:rgba(255,255,255,0.03);text-align:center;"><div class="mono" style="font-size:14px;font-weight:700;color:#fff;">' + counts.drive + '</div><div style="font-size:10px;color:var(--muted);">Drive</div></div>'
+          + '<div style="padding:7px;border-radius:10px;background:rgba(255,255,255,0.03);text-align:center;"><div class="mono" style="font-size:14px;font-weight:700;color:#fff;">' + counts.gmail + '</div><div style="font-size:10px;color:var(--muted);">Gmail</div></div>'
+          + '<div style="padding:7px;border-radius:10px;background:rgba(255,255,255,0.03);text-align:center;"><div class="mono" style="font-size:14px;font-weight:700;color:#fff;">' + counts.calendar + '</div><div style="font-size:10px;color:var(--muted);">Agenda</div></div>'
+          + '<div style="padding:7px;border-radius:10px;background:rgba(255,255,255,0.03);text-align:center;"><div class="mono" style="font-size:14px;font-weight:700;color:#fff;">' + counts.tasks + '</div><div style="font-size:10px;color:var(--muted);">Tarefas</div></div>'
+          + '</div>';
+      }
       html += '<div style="display:flex;gap:8px;flex-wrap:wrap;">'
-        + '<button class="btn sm emerald" onclick="syncGoogleNow()">' + ICONS.refresh + ' Sincronizar</button>'
-        + '<button class="btn sm cyan" onclick="openModule(\\'settings\\'); closeAllPopovers();">Explorar Drive & Gmail</button>'
+        + (!IS_ANDROID_BRIDGE ? '<button class="btn sm emerald" onclick="syncGoogleNow()">' + ICONS.refresh + ' Sincronizar</button>' : '<button class="btn sm cyan" onclick="openRemoteHudExternal()">Abrir HUD Web</button>')
+        + '<button class="btn sm cyan" onclick="openModule(\\'settings\\'); closeAllPopovers();">' + (IS_ANDROID_BRIDGE ? 'Configurações' : 'Explorar Drive & Gmail') + '</button>'
         + '<button class="btn sm danger" style="margin-left:auto;" onclick="disconnectGoogle()">Desconectar</button>'
         + '</div>';
     } else {
       html += '<button class="gsi-material-button" style="width:100%;" onclick="connectGoogleOneClick()">' + ICONS.googleG + '<span>Conectar com Google (1 Clique)</span></button>';
       html += '<div style="display:flex;gap:8px;">'
-        + '<button class="btn sm" style="flex:1;" onclick="openModule(\\'settings\\'); closeAllPopovers();">OAuth Client ID / Token</button>'
+        + (IS_ANDROID_BRIDGE
+          ? '<button class="btn sm cyan" style="flex:1;" onclick="openRemoteHudExternal()">Abrir HUD Web (Navegador)</button>'
+          : '<button class="btn sm" style="flex:1;" onclick="openModule(\\'settings\\'); closeAllPopovers();">OAuth Client ID / Token</button>')
         + '</div>';
     }
     html += '</div>';
@@ -1725,6 +1742,19 @@ export function getLocalHoloUiHtml(options?: LocalHoloUiOptions): string {
     body.innerHTML = html;
   }
 
+  window.openRemoteHudExternal = function(customOrigin) {
+    var origin = (customOrigin || state.cloudOrigin || DEFAULT_CLOUD_ORIGIN || '').trim().replace(/\\/+$/, '');
+    if (!origin) {
+      toast('Informe a URL do Aegis Web.');
+      return;
+    }
+    if (IS_ANDROID_BRIDGE && window.AegisAndroid && window.AegisAndroid.openRemoteHud) {
+      window.AegisAndroid.openRemoteHud(origin);
+      return;
+    }
+    window.open(origin, '_blank');
+  };
+
   // ===== Google OAuth 1-Click & Direct Popup Flow =====
   window.connectGoogleOneClick = function() {
     var origin = (state.cloudOrigin || DEFAULT_CLOUD_ORIGIN || '').replace(/\\/+$/, '');
@@ -1734,9 +1764,16 @@ export function getLocalHoloUiHtml(options?: LocalHoloUiOptions): string {
       toast('Informe a URL do Aegis Web ou seu Google OAuth Client ID.');
       return;
     }
-    if (IS_ANDROID_BRIDGE && window.AegisAndroid && window.AegisAndroid.openRemoteHud) {
-      window.AegisAndroid.openRemoteHud(origin);
-      return;
+    if (IS_ANDROID_BRIDGE && window.AegisAndroid) {
+      if (window.AegisAndroid.connectGoogleWorkspace) {
+        toast('Abrindo login Google seguro no navegador...');
+        window.AegisAndroid.connectGoogleWorkspace(origin);
+        return;
+      }
+      if (window.AegisAndroid.openRemoteHud) {
+        window.AegisAndroid.openRemoteHud(origin);
+        return;
+      }
     }
     var returnTo = window.location.origin + '/google/oauth/receive';
     var url = origin + '/?aegis_local_google_connect=1&return_to=' + encodeURIComponent(returnTo);
@@ -1746,6 +1783,13 @@ export function getLocalHoloUiHtml(options?: LocalHoloUiOptions): string {
     } else {
       toast('Conclua o login Google na janela aberta...');
     }
+  };
+
+  window.onAndroidGoogleConnected = function(email) {
+    refreshStatusAndGoogle();
+    loadMeshStatus();
+    if (state.activeModule === 'settings' || state.activeModule === 'devices') renderModuleContent();
+    toast('Conta Google conectada' + (email ? ': ' + email : '!'));
   };
 
   window.connectGoogleDirectClientId = function() {
@@ -1795,6 +1839,13 @@ export function getLocalHoloUiHtml(options?: LocalHoloUiOptions): string {
 
   window.disconnectGoogle = async function() {
     try {
+      if (IS_ANDROID_BRIDGE && window.AegisAndroid && window.AegisAndroid.disconnectGoogle) {
+        window.AegisAndroid.disconnectGoogle();
+        await refreshStatusAndGoogle();
+        if (state.activeModule === 'settings' || state.activeModule === 'devices') renderModuleContent();
+        toast('Conta Google desconectada.');
+        return;
+      }
       await api('/connections', { method: 'POST', body: { provider: 'google', token: null } });
       await refreshStatusAndGoogle();
       if (state.activeModule === 'settings') renderModuleContent();
@@ -1858,8 +1909,8 @@ export function getLocalHoloUiHtml(options?: LocalHoloUiOptions): string {
       + '<span class="tag ' + (gConn ? 'emerald' : 'amber') + '">' + (gConn ? 'Google Conectado' : 'Google Offline') + '</span>'
       + '</div>'
       + '<div style="display:flex;align-items:center;justify-content:space-between;font-size:11px;color:var(--muted);">'
-      + '<span class="mono">' + fmtNum(tot.totalTokens || 0) + ' tokens · ' + (tot.curationsSkipped || 0) + ' economias</span>'
-      + (!IS_ANDROID_BRIDGE ? '<button class="btn sm danger" onclick="logoutLocal()">' + ICONS.logout + ' Sair</button>' : '')
+      + '<span class="mono">' + (IS_ANDROID_BRIDGE ? (state.biometricEnabled ? 'Biometria ativa ✓' : 'Login local ativo') : (fmtNum(tot.totalTokens || 0) + ' tokens · ' + (tot.curationsSkipped || 0) + ' economias')) + '</span>'
+      + '<button class="btn sm danger" onclick="logoutLocal()">' + ICONS.logout + (IS_ANDROID_BRIDGE ? ' Bloquear' : ' Sair') + '</button>'
       + '</div>';
   }
 
@@ -2502,28 +2553,32 @@ export function getLocalHoloUiHtml(options?: LocalHoloUiOptions): string {
       try { m = JSON.parse(window.AegisAndroid.getMeshStatusJson() || '{}'); state.meshStatus = m; } catch (e) {}
     }
     var tr = (m && m.transports) || {};
-    var lanIps = (m && Array.isArray(m.lanIps) && m.lanIps.length) ? m.lanIps.join(', ') : 'Aguardando rede...';
+    var lanIps = (m && Array.isArray(m.lanIps) && m.lanIps.length) ? m.lanIps.join(', ') : 'Aguardando Wi-Fi...';
     var peers = (m && Array.isArray(m.peers)) ? m.peers : [];
     var secSource = (m && m.meshSecretSource) || 'none';
+    var autoPairLan = m && typeof m.autoPairLan === 'boolean' ? m.autoPairLan : true;
     var cloudOk = tr.cloudWs === 'online';
 
     var html = '<div class="spatial-card" style="padding:16px;display:flex;flex-direction:column;gap:12px;">'
       + '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">'
-      + '<div><div style="font-size:14px;font-weight:700;color:#fff;">Malha Automática Multi-Conexão</div>'
-      + '<div style="font-size:11.5px;color:var(--muted);">Descoberta automática sem cabo (Wi-Fi/LAN P2P + Nuvem WebSocket + Auto-Pareamento Google + ADB USB/Wi-Fi)</div></div>'
-      + '<button class="btn sm primary" onclick="scanMeshAll()" ' + (state.meshScanning ? 'disabled' : '') + '>' + ICONS.refresh + (state.meshScanning ? ' Escaneando...' : ' Escanear Malha') + '</button>'
-      + '</div>'
+      + '<div><div style="font-size:14.5px;font-weight:700;color:#fff;">' + (IS_ANDROID_BRIDGE ? 'Conexão Automática com seu Computador' : 'Malha Automática Multi-Conexão') + '</div>'
+      + '<div style="font-size:11.5px;color:var(--muted);">' + (IS_ANDROID_BRIDGE ? 'Assim que o Aegis abre no celular e no PC no mesmo Wi-Fi, ambos se encontram e se conectam sozinhos.' : 'Descoberta e pareamento automáticos no Wi-Fi local (zero configuração) + Nuvem + ADB') + '</div></div>'
+      + '<div style="display:flex;gap:7px;flex-wrap:wrap;">'
+      + '<button class="btn sm ' + (autoPairLan ? 'emerald' : '') + '" onclick="toggleAutoPairLan()">' + (autoPairLan ? 'Wi-Fi Auto: ON' : 'Wi-Fi Auto: OFF') + '</button>'
+      + '<button class="btn sm primary" onclick="scanMeshAll()" ' + (state.meshScanning ? 'disabled' : '') + '>' + ICONS.refresh + (state.meshScanning ? ' Buscando...' : (IS_ANDROID_BRIDGE ? ' Buscar PC' : ' Escanear Malha')) + '</button>'
+      + '</div></div>'
       + '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">'
-      + '<span class="tag ' + (tr.lanDiscovery ? 'emerald' : 'amber') + '">LAN UDP :' + esc((m && m.lanDiscoveryPort) || 38471) + ' · ' + (tr.lanDiscovery ? 'Ativo' : 'Standby') + '</span>'
-      + '<span class="tag ' + (tr.lanP2p ? 'emerald' : 'amber') + '">P2P Direto :' + esc((m && m.lanMeshPort) || 38472) + ' · ' + (tr.lanP2p ? 'HMAC-SHA256' : 'Standby') + '</span>'
-      + '<span class="tag ' + (cloudOk ? 'cyan' : 'amber') + '">Nuvem WS · ' + esc(tr.cloudWs || 'idle') + '</span>'
-      + (!IS_ANDROID_BRIDGE ? '<span class="tag amber">ADB USB/Wi-Fi · ' + esc(tr.adbCount || state.adbDevices.length) + '</span>' : '')
-      + '<span class="tag mono">IP Local: ' + esc(lanIps) + '</span>'
+      + '<span class="tag ' + (tr.lanDiscovery ? 'emerald' : 'amber') + '">Wi-Fi Auto · ' + (tr.lanDiscovery ? 'Procurando' : 'Standby') + '</span>'
+      + '<span class="tag ' + (tr.lanP2p ? 'emerald' : 'amber') + '">P2P Direto · ' + (autoPairLan ? 'Zero-Config' : 'Chave Manual') + '</span>'
+      + '<span class="tag ' + (cloudOk ? 'cyan' : 'amber') + '">Nuvem WS · ' + esc(tr.cloudWs || 'standby') + '</span>'
+      + (!IS_ANDROID_BRIDGE ? '<span class="tag amber">ADB · ' + esc(tr.adbCount || state.adbDevices.length) + '</span>' : '')
+      + '<span class="tag mono">IP: ' + esc(lanIps) + '</span>'
       + '</div>';
 
     if (!peers.length) {
-      html += '<div style="font-size:12px;color:var(--muted);padding:12px;border-radius:12px;background:rgba(255,255,255,0.03);line-height:1.5;">'
-        + 'Nenhum outro dispositivo Aegis detectado ainda. Abra o Aegis no celular Android, Linux ou Windows na mesma rede Wi-Fi (descoberta automática instantânea) ou conecte ambos à mesma conta Google / Aegis Cloud.'
+      html += '<div style="font-size:12px;color:var(--muted);padding:14px;border-radius:12px;background:rgba(56,189,248,0.06);border:1px dashed rgba(56,189,248,0.28);line-height:1.55;">'
+        + '<strong style="color:#e0f2fe;">Aguardando ' + (IS_ANDROID_BRIDGE ? 'seu computador' : 'outros dispositivos Aegis') + ' na rede Wi-Fi...</strong><br/>'
+        + 'Basta abrir o aplicativo Aegis no ' + (IS_ANDROID_BRIDGE ? 'PC (Linux ou Windows)' : 'celular Android ou outro PC') + ' conectado ao mesmo roteador Wi-Fi. A descoberta e a troca segura de chaves acontecem automaticamente em até 3 segundos.'
         + '</div>';
     } else {
       for (var pi = 0; pi < peers.length; pi++) {
@@ -2532,28 +2587,29 @@ export function getLocalHoloUiHtml(options?: LocalHoloUiOptions): string {
         var trHtml = '';
         for (var ti = 0; ti < pTransports.length; ti++) trHtml += fmtMeshTransportTag(pTransports[ti]) + ' ';
         var defaultPath = p.platform === 'android' ? '/sdcard' : '.';
-        html += '<div class="spatial-card" style="padding:12px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">'
+        var isReady = Boolean(p.autoPaired || autoPairLan || secSource !== 'none' || pTransports.indexOf('cloud_ws') >= 0);
+        html += '<div class="spatial-card" style="padding:13px;border-color:rgba(52,211,153,0.32);display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">'
           + '<div style="min-width:180px;">'
-          + '<div style="font-size:13px;font-weight:700;color:#fff;display:flex;align-items:center;gap:6px;flex-wrap:wrap;">'
+          + '<div style="font-size:13.5px;font-weight:700;color:#fff;display:flex;align-items:center;gap:6px;flex-wrap:wrap;">'
           + '<span>' + esc(p.name || p.id) + '</span>'
           + '<span class="tag mono">' + esc(String(p.platform || 'device').toUpperCase()) + '</span>'
+          + (isReady ? '<span class="tag emerald">Pronto ✓</span>' : '')
           + '</div>'
           + '<div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:5px;">' + trHtml
           + (p.lanIp ? '<span class="tag mono">' + esc(p.lanIp) + '</span>' : '')
           + '</div></div>'
           + '<div style="display:flex;gap:6px;flex-wrap:wrap;">'
-          + '<button class="btn sm cyan" onclick="runMeshPeerCmd(\\'' + esc(p.id) + '\\', \\'ping\\', {})">Ping Auto</button>'
+          + '<button class="btn sm cyan" onclick="runMeshPeerCmd(\\'' + esc(p.id) + '\\', \\'ping\\', {})">Testar Conexão</button>'
           + '<button class="btn sm" onclick="runMeshPeerCmd(\\'' + esc(p.id) + '\\', \\'telemetry\\', {})">Telemetria</button>'
           + '<button class="btn sm" onclick="runMeshPeerCmd(\\'' + esc(p.id) + '\\', \\'list_files\\', { path: \\'' + esc(defaultPath) + '\\' })">Arquivos</button>'
           + '</div></div>';
       }
     }
 
-    html += '<div class="grid-2" style="margin-top:4px;">'
-      + '<div style="padding:12px;border-radius:12px;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.07);display:flex;flex-direction:column;gap:8px;">'
-      + '<div style="font-size:12px;font-weight:700;color:#fff;">Área de Transferência Multi-Dispositivo</div>'
+    html += '<div style="padding:12px;border-radius:12px;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.07);display:flex;flex-direction:column;gap:8px;">'
+      + '<div style="font-size:12px;font-weight:700;color:#fff;">Área de Transferência Instantânea (PC ↔ Android)</div>'
       + '<div style="display:flex;gap:6px;">'
-      + '<input id="mesh-clip-inp" class="inp" placeholder="Texto ou link para enviar a todos os aparelhos..." />'
+      + '<input id="mesh-clip-inp" class="inp" placeholder="Enviar texto ou link direto para o outro aparelho..." />'
       + '<button class="btn sm primary" onclick="sendMeshClipboard()">Enviar</button>'
       + '</div>';
     if (m && m.recentClipboard && m.recentClipboard.text) {
@@ -2562,17 +2618,7 @@ export function getLocalHoloUiHtml(options?: LocalHoloUiOptions): string {
         + '<button class="btn sm" onclick="copyMeshClipboard()">Copiar</button>'
         + '</div>';
     }
-    html += '</div>'
-      + '<div style="padding:12px;border-radius:12px;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.07);display:flex;flex-direction:column;gap:8px;">'
-      + '<div style="display:flex;align-items:center;justify-content:space-between;gap:6px;">'
-      + '<div style="font-size:12px;font-weight:700;color:#fff;">Chave de Malha LAN (HMAC-SHA256)</div>'
-      + '<span class="tag ' + (secSource !== 'none' ? 'emerald' : 'amber') + '">'
-      + (secSource === 'custom_key' ? 'Chave Definida' : (secSource === 'google_account' ? 'Auto via Google' : 'Somente Descoberta'))
-      + '</span></div>'
-      + '<div style="display:flex;gap:6px;">'
-      + '<input id="mesh-key-inp" type="password" class="inp" placeholder="Use a mesma senha no PC e no Android (offline)..." />'
-      + '<button class="btn sm emerald" onclick="saveMeshKeyConfig()">Salvar</button>'
-      + '</div></div></div>';
+    html += '</div>';
 
     if (state.meshOutput) {
       html += '<pre class="mono" style="font-size:11.5px;background:rgba(0,0,0,0.45);padding:12px;border-radius:12px;max-height:220px;overflow:auto;color:var(--cyan);">' + esc(state.meshOutput) + '</pre>';
@@ -2583,21 +2629,32 @@ export function getLocalHoloUiHtml(options?: LocalHoloUiOptions): string {
       var stJson = {};
       try { stJson = JSON.parse(window.AegisAndroid.getStatusJson() || '{}'); } catch (e) {}
       html += '<div class="spatial-card" style="padding:16px;display:flex;flex-direction:column;gap:12px;margin-top:12px;">'
-        + '<div style="display:flex;align-items:center;justify-content:space-between;">'
-        + '<div><div style="font-size:14px;font-weight:700;color:#fff;">Agente Android Nativo (Nuvem 24/7)</div>'
-        + '<div style="font-size:11.5px;color:var(--muted);">Conecte à sua instância Aegis Cloud para acesso fora do Wi-Fi + Google Workspace</div></div>'
-        + '<span class="tag ' + (stJson.serviceRunning ? 'emerald' : 'amber') + '">' + (stJson.serviceRunning ? 'Serviço Ativo' : 'Parado') + '</span>'
-        + '</div>'
-        + '<div class="grid-2">'
-        + '<div><label style="font-size:11px;color:var(--muted);">URL do Aegis Cloud</label><input id="and-origin" class="inp" value="' + esc(stJson.serverOrigin || stJson.origin || state.cloudOrigin) + '" /></div>'
-        + '<div><label style="font-size:11px;color:var(--muted);">Código de Pareamento</label><input id="and-code" class="inp" placeholder="AEGIS-XXXX" value="' + esc(stJson.pairingCode || '') + '" /></div>'
+        + '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">'
+        + '<div><div style="font-size:14px;font-weight:700;color:#fff;">Acesso Remoto (Fora do Wi-Fi) & Google Workspace</div>'
+        + '<div style="font-size:11.5px;color:var(--muted);">Opcional: conecte ao Google ou ao Aegis Cloud para controlar fora de casa</div></div>'
+        + '<span class="tag ' + (stJson.serviceRunning ? 'emerald' : 'amber') + '">' + (stJson.serviceRunning ? 'Serviço 24/7 Ativo' : 'Somente Wi-Fi Local') + '</span>'
         + '</div>'
         + '<div style="display:flex;gap:8px;flex-wrap:wrap;">'
-        + '<button class="btn primary" onclick="androidStartBridge()">Conectar & Iniciar 24/7</button>'
-        + '<button class="btn danger" onclick="window.AegisAndroid.stopService(); renderModuleContent();">Parar Serviço</button>'
-        + '<button class="btn cyan" onclick="window.AegisAndroid.openRemoteHud(document.getElementById(\\'and-origin\\').value)">Abrir HUD Web + Google</button>'
-        + '</div></div>'
-        + '<div class="spatial-card" style="padding:16px;margin-top:12px;"><div style="font-size:13px;font-weight:700;color:#fff;margin-bottom:10px;">Permissões Nativas do Sistema Android</div>'
+        + '<button class="gsi-material-button" onclick="connectGoogleOneClick()">' + ICONS.googleG + '<span>' + (stJson.googleConnected ? ('Google: ' + esc(stJson.googleEmail || 'Conectado')) : 'Conectar Google Workspace') + '</span></button>'
+        + '<button class="btn cyan" onclick="openRemoteHudExternal(document.getElementById(\\'and-origin\\') ? document.getElementById(\\'and-origin\\').value : \\'\\')">Abrir HUD Web (Chrome)</button>'
+        + '</div>'
+        + '<details style="border-top:1px solid rgba(255,255,255,0.08);padding-top:10px;">'
+        + '<summary style="cursor:pointer;font-size:12px;color:var(--amber-soft);font-weight:600;">Opções avançadas (URL Cloud, Código Manual e Chave LAN)</summary>'
+        + '<div style="display:flex;flex-direction:column;gap:10px;margin-top:10px;">'
+        + '<div class="grid-2">'
+        + '<div><label style="font-size:11px;color:var(--muted);">URL do Aegis Cloud</label><input id="and-origin" class="inp" value="' + esc(stJson.serverOrigin || state.cloudOrigin) + '" /></div>'
+        + '<div><label style="font-size:11px;color:var(--muted);">Código de Pareamento (opcional)</label><input id="and-code" class="inp" placeholder="AEGIS-XXXX" value="' + esc(stJson.pairingCode || '') + '" /></div>'
+        + '</div>'
+        + '<div style="display:flex;gap:8px;flex-wrap:wrap;">'
+        + '<button class="btn sm primary" onclick="androidStartBridge()">Conectar Nuvem 24/7</button>'
+        + '<button class="btn sm danger" onclick="window.AegisAndroid.stopService(); renderModuleContent();">Parar Serviço</button>'
+        + '</div>'
+        + '<div style="display:flex;gap:6px;align-items:center;">'
+        + '<input id="mesh-key-inp" type="password" class="inp" placeholder="Chave manual opcional (substitui auto-pareamento)..." />'
+        + '<button class="btn sm emerald" onclick="saveMeshKeyConfig()">Salvar Chave</button>'
+        + '</div></div></details>'
+        + '</div>'
+        + '<div class="spatial-card" style="padding:16px;margin-top:12px;"><div style="font-size:13px;font-weight:700;color:#fff;margin-bottom:10px;">Permissões Nativas do Android</div>'
         + '<div class="grid-2">'
         + '<button class="btn" onclick="window.AegisAndroid.openAccessibilitySettings()">Acessibilidade (Automação de Tela)</button>'
         + '<button class="btn" onclick="window.AegisAndroid.openNotificationSettings()">Leitura de Notificações</button>'
@@ -2607,6 +2664,17 @@ export function getLocalHoloUiHtml(options?: LocalHoloUiOptions): string {
       body.innerHTML = html;
       return;
     }
+
+    html += '<div class="spatial-card" style="padding:14px;margin-top:12px;display:flex;flex-direction:column;gap:8px;">'
+      + '<div style="display:flex;align-items:center;justify-content:space-between;gap:6px;">'
+      + '<div style="font-size:12.5px;font-weight:700;color:#fff;">Chave de Malha LAN Manual (Opcional)</div>'
+      + '<span class="tag ' + (secSource !== 'none' ? 'emerald' : 'amber') + '">'
+      + (secSource === 'custom_key' ? 'Chave Manual' : (secSource === 'google_account' ? 'Auto via Google' : (autoPairLan ? 'Auto-Pareamento Wi-Fi Ativo' : 'Somente Descoberta')))
+      + '</span></div>'
+      + '<div style="display:flex;gap:6px;">'
+      + '<input id="mesh-key-inp" type="password" class="inp" placeholder="Opcional: defina uma senha fixa se quiser desativar o Wi-Fi Auto..." />'
+      + '<button class="btn sm emerald" onclick="saveMeshKeyConfig()">Salvar</button>'
+      + '</div></div>';
 
     html += '<div class="spatial-card" style="padding:16px;display:flex;flex-direction:column;gap:12px;margin-top:12px;">'
       + '<div style="display:flex;align-items:center;justify-content:space-between;">'
@@ -2665,6 +2733,20 @@ export function getLocalHoloUiHtml(options?: LocalHoloUiOptions): string {
       state.meshScanning = false;
       if (state.activeModule === 'devices') renderModuleContent();
     }
+  };
+
+  window.toggleAutoPairLan = async function() {
+    var cur = state.meshStatus && typeof state.meshStatus.autoPairLan === 'boolean' ? state.meshStatus.autoPairLan : true;
+    var next = !cur;
+    try {
+      if (IS_ANDROID_BRIDGE && window.AegisAndroid && window.AegisAndroid.setAutoPairLan) {
+        state.meshStatus = JSON.parse(window.AegisAndroid.setAutoPairLan(next) || '{}');
+      } else if (!IS_ANDROID_BRIDGE) {
+        state.meshStatus = await api('/mesh/config', { method: 'POST', body: { autoPairLan: next } });
+      }
+      toast(next ? 'Conexão Automática no Wi-Fi ativada!' : 'Conexão Automática no Wi-Fi pausada.');
+      if (state.activeModule === 'devices') renderModuleContent();
+    } catch (e) { toast(e.message); }
   };
 
   window.saveMeshKeyConfig = async function() {
@@ -3012,7 +3094,7 @@ export function getLocalHoloUiHtml(options?: LocalHoloUiOptions): string {
     var html = '<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">'
       + '<div class="tab-bar">'
       + '<button class="tab-btn ' + (state.settingsTab === 'google' ? 'active' : '') + '" onclick="state.settingsTab=\\'google\\'; renderModuleContent();">' + ICONS.googleG + ' Google Workspace</button>'
-      + '<button class="tab-btn ' + (state.settingsTab === 'system' ? 'active' : '') + '" onclick="state.settingsTab=\\'system\\'; renderModuleContent();">' + ICONS.key + ' API Key & Ponte Nuvem</button>'
+      + '<button class="tab-btn ' + (state.settingsTab === 'system' ? 'active' : '') + '" onclick="state.settingsTab=\\'system\\'; renderModuleContent();">' + (IS_ANDROID_BRIDGE ? (ICONS.fingerprint + ' Segurança & Biometria') : (ICONS.key + ' API Key & Ponte Nuvem')) + '</button>'
       + '</div></div>';
 
     if (state.settingsTab === 'google') {
@@ -3023,19 +3105,24 @@ export function getLocalHoloUiHtml(options?: LocalHoloUiOptions): string {
       html += '<div class="spatial-card" style="padding:16px;display:flex;flex-direction:column;gap:12px;">'
         + '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">'
         + '<div style="display:flex;align-items:center;gap:11px;">' + ICONS.googleG
-        + '<div><div style="font-size:14px;font-weight:700;color:#fff;">Conexão Google no App Local</div>'
-        + '<div style="font-size:11.5px;color:var(--muted);">' + (connected ? ('Conectado como ' + esc(g.email || 'Google') + (g.lastSyncAt ? ' · Última sinc.: ' + new Date(g.lastSyncAt).toLocaleTimeString('pt-BR') : '')) : 'Conecte sua conta Google para Drive, Gmail, Agenda e Tarefas diretamente pelo aplicativo local.') + '</div></div></div>'
+        + '<div><div style="font-size:14px;font-weight:700;color:#fff;">' + (IS_ANDROID_BRIDGE ? 'Conexão Google no Android' : 'Conexão Google no App Local') + '</div>'
+        + '<div style="font-size:11.5px;color:var(--muted);">' + (connected ? ('Conectado como ' + esc(g.email || 'Google') + (g.lastSyncAt ? ' · Última sinc.: ' + new Date(g.lastSyncAt).toLocaleTimeString('pt-BR') : '')) : (IS_ANDROID_BRIDGE ? 'Autorize sua conta Google pelo Chrome seguro para sincronizar automaticamente com o PC e a Nuvem.' : 'Conecte sua conta Google para Drive, Gmail, Agenda e Tarefas diretamente pelo aplicativo local.')) + '</div></div></div>'
         + '<div style="display:flex;gap:8px;flex-wrap:wrap;">';
 
       if (connected) {
-        html += '<button class="btn emerald sm" onclick="syncGoogleNow()">' + ICONS.refresh + ' Sincronizar Agora</button>'
+        html += (IS_ANDROID_BRIDGE
+          ? '<button class="btn cyan sm" onclick="openRemoteHudExternal()">Abrir HUD Web (Chrome)</button>'
+          : '<button class="btn emerald sm" onclick="syncGoogleNow()">' + ICONS.refresh + ' Sincronizar Agora</button>')
           + '<button class="btn danger sm" onclick="disconnectGoogle()">Desconectar</button>';
       } else {
         html += '<button class="gsi-material-button" onclick="connectGoogleOneClick()">' + ICONS.googleG + '<span>Conectar com Google (1 Clique)</span></button>';
+        if (IS_ANDROID_BRIDGE) {
+          html += '<button class="btn cyan sm" onclick="openRemoteHudExternal()">Abrir HUD Web (Chrome)</button>';
+        }
       }
       html += '</div></div>';
 
-      if (!connected) {
+      if (!connected && !IS_ANDROID_BRIDGE) {
         html += '<div class="grid-2">'
           + '<div style="padding:12px;border-radius:14px;background:rgba(255,255,255,0.025);border:1px solid rgba(255,255,255,0.07);display:flex;flex-direction:column;gap:8px;">'
           + '<div style="font-size:12px;font-weight:700;color:var(--amber-soft);">Opção Direta — Google OAuth Client ID</div>'
@@ -3052,7 +3139,7 @@ export function getLocalHoloUiHtml(options?: LocalHoloUiOptions): string {
       }
       html += '</div>';
 
-      if (connected) {
+      if (connected && !IS_ANDROID_BRIDGE) {
         html += '<div class="tab-bar">'
           + '<button class="tab-btn ' + (state.workspaceSubTab === 'drive' ? 'active' : '') + '" onclick="state.workspaceSubTab=\\'drive\\'; if(!state.driveItems.length) loadDriveFolder(\\'root\\'); renderModuleContent();">Drive (' + (g.counts ? g.counts.drive : 0) + ')</button>'
           + '<button class="tab-btn ' + (state.workspaceSubTab === 'gmail' ? 'active' : '') + '" onclick="state.workspaceSubTab=\\'gmail\\'; renderModuleContent();">Gmail (' + (g.counts ? g.counts.gmail : 0) + ')</button>'
@@ -3134,30 +3221,60 @@ export function getLocalHoloUiHtml(options?: LocalHoloUiOptions): string {
         html += '</div>';
       }
     } else {
-      // System: API Key + Cloud Origin + Cloud Relay
-      html += '<div class="grid-2">'
-        + '<div class="spatial-card" style="padding:16px;display:flex;flex-direction:column;gap:11px;">'
-        + '<div style="display:flex;align-items:center;justify-content:space-between;">'
-        + '<div style="font-size:13.5px;font-weight:700;color:#fff;">Chave API Gemini & OAuth Bridge</div>'
-        + '<span class="tag ' + (state.hasApiKey ? 'emerald' : 'rose') + '">' + (state.hasApiKey ? 'API Key Ativa' : 'Sem API Key') + '</span>'
-        + '</div>'
-        + '<div><label style="font-size:11px;color:var(--muted);">GEMINI_API_KEY (salva com permissão 0600 em ~/.config/aegis/env)</label>'
-        + '<input id="set-api-key" class="inp mono" type="password" placeholder="AIzaSy... (deixe em branco para manter a atual)" /></div>'
-        + '<div><label style="font-size:11px;color:var(--muted);">URL do Aegis Web (usada no botão Conectar com Google 1-Clique)</label>'
-        + '<input id="set-cloud-origin" class="inp" value="' + esc(state.cloudOrigin) + '" /></div>'
-        + '<button class="btn primary" onclick="saveSystemSettings()">Salvar Configurações Locais</button>'
-        + '</div>'
-        + '<div class="spatial-card" style="padding:16px;display:flex;flex-direction:column;gap:11px;">'
-        + '<div style="font-size:13.5px;font-weight:700;color:#fff;">Ponte Remota com Aegis Cloud</div>'
-        + '<div style="font-size:11.5px;color:var(--muted);line-height:1.45;">Opcional: pareie esta máquina local com o Aegis Web para enviar comandos à distância.</div>'
-        + '<div><label style="font-size:11px;color:var(--muted);">URL Aegis Cloud</label><input id="bridge-url" class="inp" value="' + esc(state.cloudOrigin) + '" /></div>'
-        + '<div><label style="font-size:11px;color:var(--muted);">Código de Pareamento</label><input id="bridge-code" class="inp mono" placeholder="AEGIS-XXXX" /></div>'
-        + '<button class="btn cyan" onclick="startCloudBridge()">Iniciar Ponte Cloud</button>'
-        + '</div></div>';
+      if (IS_ANDROID_BRIDGE) {
+        html += '<div class="spatial-card" style="padding:16px;display:flex;flex-direction:column;gap:12px;">'
+          + '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">'
+          + '<div style="display:flex;align-items:center;gap:10px;">'
+          + '<div class="nav-ico-box" style="background:rgba(56,189,248,0.12);border-color:rgba(56,189,248,0.35);color:var(--cyan);">' + ICONS.fingerprint + '</div>'
+          + '<div><div style="font-size:14px;font-weight:700;color:#fff;">Segurança & Desbloqueio por Impressão Digital</div>'
+          + '<div style="font-size:11.5px;color:var(--muted);">Operador: ' + esc(state.username || 'Local') + ' · ' + (state.biometricAvailable ? (state.biometricEnabled ? 'Impressão digital habilitada' : 'Sensor disponível (desativado)') : 'Nenhuma biometria cadastrada no Android') + '</div></div></div>'
+          + '<span class="tag ' + (state.biometricEnabled ? 'emerald' : 'amber') + '">' + (state.biometricEnabled ? 'Biometria ON' : 'Somente Senha') + '</span>'
+          + '</div>'
+          + '<div style="display:flex;gap:8px;flex-wrap:wrap;">'
+          + '<button class="btn ' + (state.biometricEnabled ? 'danger' : 'cyan') + '" onclick="toggleAndroidBiometric()">' + ICONS.fingerprint + (state.biometricEnabled ? ' Desativar Impressão Digital' : ' Ativar Impressão Digital') + '</button>'
+          + '<button class="btn" onclick="logoutLocal()">' + ICONS.logout + ' Bloquear Aplicativo Agora</button>'
+          + '</div></div>';
+      } else {
+        // System: API Key + Cloud Origin + Cloud Relay
+        html += '<div class="grid-2">'
+          + '<div class="spatial-card" style="padding:16px;display:flex;flex-direction:column;gap:11px;">'
+          + '<div style="display:flex;align-items:center;justify-content:space-between;">'
+          + '<div style="font-size:13.5px;font-weight:700;color:#fff;">Chave API Gemini & OAuth Bridge</div>'
+          + '<span class="tag ' + (state.hasApiKey ? 'emerald' : 'rose') + '">' + (state.hasApiKey ? 'API Key Ativa' : 'Sem API Key') + '</span>'
+          + '</div>'
+          + '<div><label style="font-size:11px;color:var(--muted);">GEMINI_API_KEY (salva com permissão 0600 em ~/.config/aegis/env)</label>'
+          + '<input id="set-api-key" class="inp mono" type="password" placeholder="AIzaSy... (deixe em branco para manter a atual)" /></div>'
+          + '<div><label style="font-size:11px;color:var(--muted);">URL do Aegis Web (usada no botão Conectar com Google 1-Clique)</label>'
+          + '<input id="set-cloud-origin" class="inp" value="' + esc(state.cloudOrigin) + '" /></div>'
+          + '<button class="btn primary" onclick="saveSystemSettings()">Salvar Configurações Locais</button>'
+          + '</div>'
+          + '<div class="spatial-card" style="padding:16px;display:flex;flex-direction:column;gap:11px;">'
+          + '<div style="font-size:13.5px;font-weight:700;color:#fff;">Ponte Remota com Aegis Cloud</div>'
+          + '<div style="font-size:11.5px;color:var(--muted);line-height:1.45;">Opcional: pareie esta máquina local com o Aegis Web para enviar comandos à distância.</div>'
+          + '<div><label style="font-size:11px;color:var(--muted);">URL Aegis Cloud</label><input id="bridge-url" class="inp" value="' + esc(state.cloudOrigin) + '" /></div>'
+          + '<div><label style="font-size:11px;color:var(--muted);">Código de Pareamento</label><input id="bridge-code" class="inp mono" placeholder="AEGIS-XXXX" /></div>'
+          + '<button class="btn cyan" onclick="startCloudBridge()">Iniciar Ponte Cloud</button>'
+          + '</div></div>';
+      }
     }
 
     body.innerHTML = html;
   }
+
+  window.toggleAndroidBiometric = function() {
+    if (!IS_ANDROID_BRIDGE || !window.AegisAndroid || !window.AegisAndroid.setBiometricEnabled) return;
+    try {
+      var res = JSON.parse(window.AegisAndroid.setBiometricEnabled(!state.biometricEnabled) || '{}');
+      if (!res.ok) {
+        toast(res.error || 'Não foi possível alterar a biometria.');
+        return;
+      }
+      state.biometricAvailable = Boolean(res.biometricAvailable);
+      state.biometricEnabled = Boolean(res.biometricEnabled);
+      toast(state.biometricEnabled ? 'Desbloqueio por impressão digital ativado!' : 'Desbloqueio por impressão digital desativado.');
+      renderModuleContent();
+    } catch (e) { toast(e.message); }
+  };
 
   window.saveGoogleClientId = async function() {
     var val = (document.getElementById('g-client-id').value || '').trim();
@@ -3242,15 +3359,64 @@ export function getLocalHoloUiHtml(options?: LocalHoloUiOptions): string {
   };
 
   // ===== Auth & Bootstrap =====
-  function showAuthGate() {
+  function showAuthGate(autoPromptBio) {
     document.getElementById('auth-overlay').classList.add('open');
+    var titleEl = document.getElementById('auth-title');
+    if (titleEl) titleEl.textContent = isAndroidMode() ? 'AEGIS ANDROID' : 'AEGIS LOCAL';
+    var footEl = document.getElementById('auth-footer');
+    if (footEl && isAndroidMode()) {
+      footEl.innerHTML = 'Credenciais protegidas com <span class="mono" style="color:var(--amber-soft);">PBKDF2-SHA256</span> e biometria nativa do Android. Descoberta Wi-Fi automática ativa em segundo plano.';
+    }
     document.getElementById('auth-subtitle').textContent = state.needsSetup
       ? 'Primeiro acesso — crie seu usuário e senha locais'
-      : 'Digite suas credenciais locais para destravar o núcleo';
+      : 'Digite suas credenciais ou use sua impressão digital';
     document.getElementById('auth-submit-btn').textContent = state.needsSetup
       ? 'Criar Conta Local & Iniciar'
       : 'Entrar no Núcleo';
+
+    var userInp = document.getElementById('auth-user');
+    if (userInp && !state.needsSetup && state.username && !userInp.value) {
+      userInp.value = state.username;
+    }
+    var passInp = document.getElementById('auth-pass');
+    if (passInp) passInp.value = '';
+
+    var bioWrap = document.getElementById('auth-bio-wrap');
+    if (bioWrap) {
+      bioWrap.style.display = (IS_ANDROID_BRIDGE && state.needsSetup && state.biometricAvailable) ? 'flex' : 'none';
+    }
+    var bioBtn = document.getElementById('auth-bio-btn');
+    if (bioBtn) {
+      bioBtn.style.display = (IS_ANDROID_BRIDGE && !state.needsSetup && state.biometricEnabled) ? 'flex' : 'none';
+    }
+    if (autoPromptBio && IS_ANDROID_BRIDGE && !state.needsSetup && state.biometricEnabled) {
+      setTimeout(function() {
+        if (!state.authenticated) triggerAndroidBiometric();
+      }, 380);
+    }
   }
+
+  window.triggerAndroidBiometric = function() {
+    if (!IS_ANDROID_BRIDGE || !window.AegisAndroid || !window.AegisAndroid.promptBiometricAuth) return;
+    var errEl = document.getElementById('auth-error');
+    if (errEl) errEl.style.display = 'none';
+    window.AegisAndroid.promptBiometricAuth();
+  };
+
+  window.onAndroidBiometricResult = function(ok, msg) {
+    var errEl = document.getElementById('auth-error');
+    if (ok) {
+      state.authenticated = true;
+      document.getElementById('auth-overlay').classList.remove('open');
+      if (errEl) errEl.style.display = 'none';
+      triggerCoreShockwave(1.0);
+      bootstrapAuthedData();
+      toast('Desbloqueado com impressão digital!');
+    } else if (msg && errEl) {
+      errEl.textContent = msg;
+      errEl.style.display = 'block';
+    }
+  };
 
   window.handleAuthSubmit = async function(e) {
     e.preventDefault();
@@ -3259,6 +3425,25 @@ export function getLocalHoloUiHtml(options?: LocalHoloUiOptions): string {
     var errEl = document.getElementById('auth-error');
     errEl.style.display = 'none';
     try {
+      if (IS_ANDROID_BRIDGE && window.AegisAndroid) {
+        var bioChk = document.getElementById('auth-bio-check');
+        var enableBio = Boolean(bioChk && bioChk.checked && state.biometricAvailable);
+        var raw = state.needsSetup
+          ? window.AegisAndroid.setupLocalUser(u, p, enableBio)
+          : window.AegisAndroid.loginLocalUser(u, p);
+        var resAnd = JSON.parse(raw || '{}');
+        if (!resAnd.ok) throw new Error(resAnd.error || 'Credenciais inválidas.');
+        state.needsSetup = false;
+        state.username = resAnd.username || u;
+        state.biometricAvailable = Boolean(resAnd.biometricAvailable);
+        state.biometricEnabled = Boolean(resAnd.biometricEnabled);
+        state.authenticated = true;
+        document.getElementById('auth-overlay').classList.remove('open');
+        triggerCoreShockwave(1.0);
+        await bootstrapAuthedData();
+        toast('Bem-vindo ao Aegis Android, ' + state.username + '!');
+        return;
+      }
       var endpoint = state.needsSetup ? '/auth/setup' : '/auth/login';
       var res = await fetch(endpoint, {
         method: 'POST',
@@ -3282,17 +3467,35 @@ export function getLocalHoloUiHtml(options?: LocalHoloUiOptions): string {
   };
 
   window.logoutLocal = async function() {
-    try { await api('/auth/logout', { method: 'POST' }); } catch (e) {}
-    state.token = '';
+    if (!IS_ANDROID_BRIDGE) {
+      try { await api('/auth/logout', { method: 'POST' }); } catch (e) {}
+      state.token = '';
+      localStorage.removeItem('aegis_local_token');
+    }
     state.authenticated = false;
-    localStorage.removeItem('aegis_local_token');
     toggleDrawer(false);
     closeModule();
-    showAuthGate();
+    showAuthGate(false);
   };
 
   async function refreshStatusAndGoogle() {
-    if (!state.authenticated || IS_ANDROID_BRIDGE) return;
+    if (!state.authenticated) return;
+    if (IS_ANDROID_BRIDGE && window.AegisAndroid) {
+      try {
+        if (window.AegisAndroid.getStatusJson) {
+          state.status = JSON.parse(window.AegisAndroid.getStatusJson() || '{}');
+          if (state.status && state.status.serverOrigin) state.cloudOrigin = state.status.serverOrigin;
+          if (typeof state.status.biometricAvailable === 'boolean') state.biometricAvailable = state.status.biometricAvailable;
+          if (typeof state.status.biometricEnabled === 'boolean') state.biometricEnabled = state.status.biometricEnabled;
+        }
+        if (window.AegisAndroid.getGoogleStatusJson) {
+          var gAnd = JSON.parse(window.AegisAndroid.getGoogleStatusJson() || '{}');
+          state.googleSync = { connected: Boolean(gAnd.connected), email: gAnd.email || '', counts: { drive: 0, gmail: 0, calendar: 0, tasks: 0 } };
+        }
+        renderGooglePillAndPopover();
+      } catch (e) {}
+      return;
+    }
     try {
       var results = await Promise.all([
         api('/status'),
@@ -3320,10 +3523,11 @@ export function getLocalHoloUiHtml(options?: LocalHoloUiOptions): string {
   }
 
   async function bootstrapAuthedData() {
-    await Promise.all([refreshStatusAndGoogle(), refreshUsage(), refreshJobs()]);
+    await Promise.all([refreshStatusAndGoogle(), refreshUsage(), refreshJobs(), loadMeshStatus()]);
     renderThinkingPanel();
     renderJobsUI();
     renderGooglePillAndPopover();
+    updateCoreBackdropClass();
   }
 
   async function initApp() {
@@ -3357,9 +3561,24 @@ export function getLocalHoloUiHtml(options?: LocalHoloUiOptions): string {
       }
     });
 
-    if (IS_ANDROID_BRIDGE) {
-      state.authenticated = true;
-      updateCoreBackdropClass();
+    if (IS_ANDROID_BRIDGE && window.AegisAndroid) {
+      try {
+        var authAnd = window.AegisAndroid.getAuthStatusJson ? JSON.parse(window.AegisAndroid.getAuthStatusJson() || '{}') : { needsSetup: false };
+        state.needsSetup = Boolean(authAnd.needsSetup);
+        state.username = authAnd.username || '';
+        state.biometricAvailable = Boolean(authAnd.biometricAvailable);
+        state.biometricEnabled = Boolean(authAnd.biometricEnabled);
+        updateCoreBackdropClass();
+        showAuthGate(true);
+      } catch (e) {
+        state.authenticated = true;
+        await bootstrapAuthedData();
+      }
+      setInterval(function() {
+        if (state.authenticated && state.activeModule === 'devices') {
+          loadMeshStatus();
+        }
+      }, 3000);
       return;
     }
 
@@ -3374,20 +3593,23 @@ export function getLocalHoloUiHtml(options?: LocalHoloUiOptions): string {
         state.authenticated = true;
         await bootstrapAuthedData();
       } else {
-        showAuthGate();
+        showAuthGate(false);
       }
     } catch (e) {
       toast('Aguardando daemon local em 127.0.0.1:3847...');
     }
 
-    // Background polling loop (fast when jobs are active, gentle when idle)
+    // Background polling loop (fast when jobs or devices module are active)
     setInterval(function() {
       if (!state.authenticated || IS_ANDROID_BRIDGE) return;
       var hasRunning = state.jobs.some(function(j) { return j.status === 'running' || j.status === 'queued'; });
       if (hasRunning || state.activePopover === 'jobs') {
         refreshJobs();
       }
-    }, 2500);
+      if (state.activeModule === 'devices') {
+        loadMeshStatus();
+      }
+    }, 3000);
 
     setInterval(function() {
       if (!state.authenticated || IS_ANDROID_BRIDGE) return;

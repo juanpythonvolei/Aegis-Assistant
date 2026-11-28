@@ -2013,6 +2013,8 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("com.google.android.material:material:1.12.0")
     implementation("androidx.webkit:webkit:1.12.1")
+    implementation("androidx.biometric:biometric:1.1.0")
+    implementation("androidx.browser:browser:1.8.0")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
 }
@@ -2042,6 +2044,7 @@ dependencies {
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
@@ -2065,12 +2068,19 @@ dependencies {
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTask"
             android:hardwareAccelerated="true"
             android:windowSoftInputMode="adjustResize"
             android:configChanges="orientation|screenSize|keyboardHidden">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="aegis" android:host="oauth" />
             </intent-filter>
         </activity>
 
@@ -2122,8 +2132,12 @@ dependencies {
 
 import android.content.Context
 import android.net.Uri
+import org.json.JSONObject
 import java.security.MessageDigest
+import java.security.SecureRandom
 import java.util.UUID
+import javax.crypto.SecretKeyFactory
+import javax.crypto.spec.PBEKeySpec
 
 object AegisConfig {
     const val DEFAULT_SERVER_ORIGIN = "${safeOrigin}"
@@ -2133,6 +2147,26 @@ object AegisConfig {
     const val LAN_MESH_PORT = 38472
 
     private const val PREFS = "aegis_native_prefs"
+    private const val PBKDF2_ITERATIONS = 120_000
+    private const val PBKDF2_KEY_BITS = 256
+
+    private fun toHex(bytes: ByteArray): String {
+        return bytes.joinToString("") { String.format("%02x", it) }
+    }
+
+    private fun fromHex(hex: String): ByteArray {
+        val clean = hex.trim()
+        if (clean.length % 2 != 0) return ByteArray(0)
+        return ByteArray(clean.length / 2) { i ->
+            clean.substring(i * 2, i * 2 + 2).toInt(16).toByte()
+        }
+    }
+
+    private fun derivePasswordHash(password: String, salt: ByteArray): ByteArray {
+        val spec = PBEKeySpec(password.toCharArray(), salt, PBKDF2_ITERATIONS, PBKDF2_KEY_BITS)
+        val factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
+        return factory.generateSecret(spec).encoded
+    }
 
     fun normalizeOrigin(raw: String?): String {
         val trimmed = (raw ?: "").trim().trimEnd('/')
@@ -2150,6 +2184,70 @@ object AegisConfig {
         } catch (_: Exception) {
             ""
         }
+    }
+
+    fun hasLocalUser(ctx: Context): Boolean {
+        val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val u = prefs.getString("local_username", "") ?: ""
+        val h = prefs.getString("local_pass_hash", "") ?: ""
+        val s = prefs.getString("local_pass_salt", "") ?: ""
+        return u.isNotBlank() && h.isNotBlank() && s.isNotBlank()
+    }
+
+    fun getLocalUsername(ctx: Context): String {
+        return ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("local_username", "") ?: ""
+    }
+
+    fun setupLocalUser(ctx: Context, username: String, password: String, enableBiometric: Boolean): Pair<Boolean, String> {
+        val cleanUser = username.trim()
+        if (cleanUser.length < 2 || cleanUser.length > 48) {
+            return Pair(false, "Informe um usuario entre 2 e 48 caracteres.")
+        }
+        if (password.length < 4 || password.length > 128) {
+            return Pair(false, "A senha deve ter no minimo 4 caracteres.")
+        }
+        return try {
+            val salt = ByteArray(16)
+            SecureRandom().nextBytes(salt)
+            val hash = derivePasswordHash(password, salt)
+            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                .putString("local_username", cleanUser)
+                .putString("local_pass_salt", toHex(salt))
+                .putString("local_pass_hash", toHex(hash))
+                .putBoolean("biometric_enabled", enableBiometric)
+                .apply()
+            Pair(true, "")
+        } catch (e: Exception) {
+            Pair(false, e.message ?: "Falha ao criptografar credenciais locais.")
+        }
+    }
+
+    fun verifyLocalUser(ctx: Context, username: String, password: String): Boolean {
+        val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val savedUser = prefs.getString("local_username", "") ?: ""
+        val savedSaltHex = prefs.getString("local_pass_salt", "") ?: ""
+        val savedHashHex = prefs.getString("local_pass_hash", "") ?: ""
+        if (savedUser.isBlank() || savedSaltHex.isBlank() || savedHashHex.isBlank()) return false
+        if (!savedUser.equals(username.trim(), ignoreCase = true)) return false
+        return try {
+            val salt = fromHex(savedSaltHex)
+            val expected = fromHex(savedHashHex)
+            if (salt.isEmpty() || expected.isEmpty()) return false
+            val computed = derivePasswordHash(password, salt)
+            MessageDigest.isEqual(expected, computed)
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    fun isBiometricEnabled(ctx: Context): Boolean {
+        return ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean("biometric_enabled", false)
+    }
+
+    fun setBiometricEnabled(ctx: Context, enabled: Boolean) {
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putBoolean("biometric_enabled", enabled)
+            .apply()
     }
 
     fun getDeviceId(ctx: Context): String {
@@ -2171,6 +2269,46 @@ object AegisConfig {
             .apply()
     }
 
+    fun isAutoPairLanEnabled(ctx: Context): Boolean {
+        return ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean("auto_pair_lan", true)
+    }
+
+    fun setAutoPairLanEnabled(ctx: Context, enabled: Boolean) {
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putBoolean("auto_pair_lan", enabled)
+            .apply()
+    }
+
+    fun getPeerKey(ctx: Context, peerId: String): String {
+        if (peerId.isBlank()) return ""
+        return try {
+            val raw = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("mesh_peer_keys", "{}") ?: "{}"
+            JSONObject(raw).optString(peerId, "")
+        } catch (_: Exception) {
+            ""
+        }
+    }
+
+    fun setPeerKey(ctx: Context, peerId: String, secret: String) {
+        if (peerId.isBlank() || secret.length < 32) return
+        try {
+            val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            val raw = prefs.getString("mesh_peer_keys", "{}") ?: "{}"
+            val obj = try { JSONObject(raw) } catch (_: Exception) { JSONObject() }
+            obj.put(peerId, secret.take(128))
+            prefs.edit().putString("mesh_peer_keys", obj.toString()).apply()
+        } catch (_: Exception) {}
+    }
+
+    fun getPairedPeersCount(ctx: Context): Int {
+        return try {
+            val raw = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("mesh_peer_keys", "{}") ?: "{}"
+            JSONObject(raw).length()
+        } catch (_: Exception) {
+            0
+        }
+    }
+
     fun getGoogleEmail(ctx: Context): String {
         return ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("google_email", "") ?: ""
     }
@@ -2181,16 +2319,38 @@ object AegisConfig {
             .apply()
     }
 
-    fun getEffectiveMeshSecret(ctx: Context): Pair<String, String> {
+    fun getGoogleAccessToken(ctx: Context): String {
+        return ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("google_access_token", "") ?: ""
+    }
+
+    fun setGoogleAccessToken(ctx: Context, token: String) {
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString("google_access_token", token.trim())
+            .apply()
+    }
+
+    fun clearGoogleAuth(ctx: Context) {
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .remove("google_access_token")
+            .remove("google_email")
+            .apply()
+    }
+
+    fun getEffectiveMeshSecret(ctx: Context, peerId: String = ""): Pair<String, String> {
         val key = getMeshKey(ctx).trim()
         if (key.isNotBlank()) return Pair(key, "custom_key")
+        if (peerId.isNotBlank()) {
+            val peerSecret = getPeerKey(ctx, peerId).trim()
+            if (peerSecret.isNotBlank()) return Pair(peerSecret, "lan_auto")
+        }
         val email = getGoogleEmail(ctx).trim().lowercase()
         if (email.isNotBlank()) {
             val digest = MessageDigest.getInstance("SHA-256")
                 .digest(("aegis-google-mesh:" + email).toByteArray(Charsets.UTF_8))
-            val hex = digest.joinToString("") { String.format("%02x", it) }
+            val hex = toHex(digest)
             return Pair(hex, "google_account")
         }
+        if (isAutoPairLanEnabled(ctx)) return Pair("", "lan_auto")
         return Pair("", "none")
     }
 
@@ -2265,6 +2425,7 @@ import android.webkit.PermissionRequest
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -2272,6 +2433,10 @@ import android.widget.FrameLayout
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
+import androidx.biometric.BiometricManager
+import androidx.biometric.BiometricPrompt
+import androidx.browser.customtabs.CustomTabColorSchemeParams
+import androidx.browser.customtabs.CustomTabsIntent
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import org.json.JSONObject
@@ -2326,6 +2491,16 @@ class MainActivity : AppCompatActivity() {
             }
 
             webViewClient = object : WebViewClient() {
+                override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                    val url = request?.url?.toString() ?: return false
+                    if (url.startsWith("file:///android_asset/")) return false
+                    if (url.startsWith("http://", ignoreCase = true) || url.startsWith("https://", ignoreCase = true)) {
+                        openUrlInCustomTab(url)
+                        return true
+                    }
+                    return false
+                }
+
                 override fun onReceivedError(
                     view: WebView?,
                     request: WebResourceRequest?,
@@ -2336,11 +2511,22 @@ class MainActivity : AppCompatActivity() {
                     val failedUrl = request?.url?.toString() ?: ""
                     if (isMainFrame && !failedUrl.startsWith("file:///android_asset/")) {
                         runOnUiThread {
-                            Toast.makeText(
-                                this@MainActivity,
-                                "Servidor remoto inacessivel. Abrindo HUD Holografica embarcada...",
-                                Toast.LENGTH_LONG
-                            ).show()
+                            view?.loadUrl(localHudUrl)
+                        }
+                    }
+                }
+
+                override fun onReceivedHttpError(
+                    view: WebView?,
+                    request: WebResourceRequest?,
+                    errorResponse: WebResourceResponse?
+                ) {
+                    super.onReceivedHttpError(view, request, errorResponse)
+                    val isMainFrame = request?.isForMainFrame ?: false
+                    val failedUrl = request?.url?.toString() ?: ""
+                    val code = errorResponse?.statusCode ?: 0
+                    if (isMainFrame && code >= 400 && !failedUrl.startsWith("file:///android_asset/")) {
+                        runOnUiThread {
                             view?.loadUrl(localHudUrl)
                         }
                     }
@@ -2368,12 +2554,163 @@ class MainActivity : AppCompatActivity() {
         // Carrega imediatamente a HUD Holografica 3D embarcada (zero tela branca, zero erro de rede)
         webView.loadUrl(localHudUrl)
 
-        // Inicia automaticamente a descoberta LAN Wi-Fi/P2P (zero cabo / zero ADB)
+        // Inicia automaticamente a descoberta LAN Wi-Fi/P2P + auto-handshake com o PC logo na abertura
         AegisForegroundService.ensureLanMeshStarted(applicationContext)
+        AegisForegroundService.triggerLanProbe(this)
 
-        // Auto-inicia o ForegroundService se ja houver token pareado + servidor valido
-        if (AegisConfig.getDeviceToken(this).isNotBlank() && AegisConfig.getWsUrl(this).isNotBlank()) {
+        // Auto-inicia o ForegroundService se ja houver token pareado ou conta Google + servidor valido
+        if ((AegisConfig.getDeviceToken(this).isNotBlank() || AegisConfig.getGoogleAccessToken(this).isNotBlank()) &&
+            AegisConfig.getWsUrl(this).isNotBlank()
+        ) {
             startAegisServiceSafely()
+        }
+
+        handleDeepLinkIntent(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleDeepLinkIntent(intent)
+    }
+
+    private fun handleDeepLinkIntent(intent: Intent?) {
+        val data = intent?.data ?: return
+        if (data.scheme != "aegis" || data.host != "oauth") return
+        val path = data.path ?: ""
+        if (path.isNotBlank() && path != "/callback") return
+
+        var token = data.getQueryParameter("access_token") ?: ""
+        var email = data.getQueryParameter("email") ?: ""
+        val fragment = data.fragment ?: ""
+        if (fragment.isNotBlank()) {
+            try {
+                val fragUri = Uri.parse("https://aegis.local/?" + fragment)
+                if (token.isBlank()) token = fragUri.getQueryParameter("access_token") ?: ""
+                if (email.isBlank()) email = fragUri.getQueryParameter("email") ?: ""
+            } catch (_: Exception) {}
+        }
+
+        if (token.isNotBlank()) {
+            AegisConfig.setGoogleAccessToken(this, token)
+            if (email.isNotBlank()) {
+                AegisConfig.setGoogleEmail(this, email)
+            }
+            AegisForegroundService.ensureLanMeshStarted(applicationContext)
+            AegisForegroundService.triggerLanProbe(this)
+            if (AegisConfig.getWsUrl(this).isNotBlank()) {
+                startAegisServiceSafely()
+            }
+            val safeEmail = email.ifBlank { AegisConfig.getGoogleEmail(this) }
+            runOnUiThread {
+                Toast.makeText(
+                    this,
+                    if (safeEmail.isNotBlank()) "Google Workspace conectado: " + safeEmail else "Google Workspace conectado!",
+                    Toast.LENGTH_LONG
+                ).show()
+                webView.post {
+                    webView.evaluateJavascript(
+                        "window.onAndroidGoogleConnected && window.onAndroidGoogleConnected(" + JSONObject.quote(safeEmail) + ");",
+                        null
+                    )
+                }
+            }
+        }
+    }
+
+    private fun openUrlInCustomTab(url: String) {
+        val normalized = AegisConfig.normalizeOrigin(url)
+        val uri = try { Uri.parse(url) } catch (_: Exception) { null }
+        val scheme = uri?.scheme?.lowercase() ?: ""
+        if (uri == null || (scheme != "http" && scheme != "https") || normalized.isBlank()) {
+            Toast.makeText(this, "URL invalida para abrir no navegador.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        try {
+            val colorParams = CustomTabColorSchemeParams.Builder()
+                .setToolbarColor(Color.parseColor("#05070B"))
+                .setNavigationBarColor(Color.parseColor("#05070B"))
+                .build()
+            val customTabs = CustomTabsIntent.Builder()
+                .setDefaultColorSchemeParams(colorParams)
+                .setShowTitle(true)
+                .setUrlBarHidingEnabled(true)
+                .build()
+            customTabs.launchUrl(this, uri)
+        } catch (_: Exception) {
+            try {
+                val fallback = Intent(Intent.ACTION_VIEW, uri).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                startActivity(fallback)
+            } catch (_: Exception) {
+                Toast.makeText(this, "Nenhum navegador encontrado para abrir o link.", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    private fun isBiometricHardwareAvailable(): Boolean {
+        return try {
+            val bm = BiometricManager.from(this)
+            val res = bm.canAuthenticate(
+                BiometricManager.Authenticators.BIOMETRIC_STRONG or
+                    BiometricManager.Authenticators.BIOMETRIC_WEAK
+            )
+            res == BiometricManager.BIOMETRIC_SUCCESS
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun notifyBiometricResult(ok: Boolean, message: String) {
+        runOnUiThread {
+            webView.post {
+                webView.evaluateJavascript(
+                    "window.onAndroidBiometricResult && window.onAndroidBiometricResult(" +
+                        (if (ok) "true" else "false") + "," + JSONObject.quote(message) + ");",
+                    null
+                )
+            }
+        }
+    }
+
+    private fun launchBiometricPrompt() {
+        runOnUiThread {
+            if (!isBiometricHardwareAvailable()) {
+                notifyBiometricResult(false, "Biometria nao disponivel ou nao cadastrada neste Android.")
+                return@runOnUiThread
+            }
+            try {
+                val executor = ContextCompat.getMainExecutor(this)
+                val prompt = BiometricPrompt(this, executor, object : BiometricPrompt.AuthenticationCallback() {
+                    override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                        super.onAuthenticationSucceeded(result)
+                        notifyBiometricResult(true, "Autenticado com impressao digital")
+                    }
+
+                    override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                        super.onAuthenticationError(errorCode, errString)
+                        notifyBiometricResult(false, errString.toString())
+                    }
+
+                    override fun onAuthenticationFailed() {
+                        super.onAuthenticationFailed()
+                        Toast.makeText(this@MainActivity, "Digital nao reconhecida. Tente novamente.", Toast.LENGTH_SHORT).show()
+                    }
+                })
+                val promptInfo = BiometricPrompt.PromptInfo.Builder()
+                    .setTitle("Desbloquear Aegis Android")
+                    .setSubtitle("Toque no sensor de impressao digital para entrar")
+                    .setNegativeButtonText("Usar senha")
+                    .setAllowedAuthenticators(
+                        BiometricManager.Authenticators.BIOMETRIC_STRONG or
+                            BiometricManager.Authenticators.BIOMETRIC_WEAK
+                    )
+                    .build()
+                prompt.authenticate(promptInfo)
+            } catch (e: Exception) {
+                notifyBiometricResult(false, e.message ?: "Erro ao iniciar leitor biometrico.")
+            }
         }
     }
 
@@ -2419,6 +2756,111 @@ class MainActivity : AppCompatActivity() {
     inner class AegisAndroidBridge {
 
         @JavascriptInterface
+        fun getAuthStatusJson(): String {
+            return try {
+                val hasUser = AegisConfig.hasLocalUser(this@MainActivity)
+                val bioAvail = isBiometricHardwareAvailable()
+                JSONObject().apply {
+                    put("needsSetup", !hasUser)
+                    put("username", AegisConfig.getLocalUsername(this@MainActivity))
+                    put("biometricAvailable", bioAvail)
+                    put("biometricEnabled", bioAvail && AegisConfig.isBiometricEnabled(this@MainActivity))
+                }.toString()
+            } catch (_: Exception) {
+                "{\"needsSetup\":true,\"biometricAvailable\":false,\"biometricEnabled\":false}"
+            }
+        }
+
+        @JavascriptInterface
+        fun setupLocalUser(username: String?, password: String?, enableBiometric: Boolean): String {
+            val bioAvail = isBiometricHardwareAvailable()
+            val bioFlag = enableBiometric && bioAvail
+            val res = AegisConfig.setupLocalUser(this@MainActivity, username ?: "", password ?: "", bioFlag)
+            return JSONObject().apply {
+                put("ok", res.first)
+                put("username", AegisConfig.getLocalUsername(this@MainActivity))
+                put("biometricAvailable", bioAvail)
+                put("biometricEnabled", bioFlag)
+                if (!res.first) put("error", res.second)
+            }.toString()
+        }
+
+        @JavascriptInterface
+        fun loginLocalUser(username: String?, password: String?): String {
+            val ok = AegisConfig.verifyLocalUser(this@MainActivity, username ?: "", password ?: "")
+            val bioAvail = isBiometricHardwareAvailable()
+            return JSONObject().apply {
+                put("ok", ok)
+                put("username", AegisConfig.getLocalUsername(this@MainActivity))
+                put("biometricAvailable", bioAvail)
+                put("biometricEnabled", bioAvail && AegisConfig.isBiometricEnabled(this@MainActivity))
+                if (!ok) put("error", "Usuario ou senha incorretos.")
+            }.toString()
+        }
+
+        @JavascriptInterface
+        fun setBiometricEnabled(enabled: Boolean): String {
+            val bioAvail = isBiometricHardwareAvailable()
+            if (enabled && !bioAvail) {
+                return JSONObject().apply {
+                    put("ok", false)
+                    put("biometricAvailable", false)
+                    put("biometricEnabled", false)
+                    put("error", "Cadastre uma impressao digital nas configuracoes do Android primeiro.")
+                }.toString()
+            }
+            AegisConfig.setBiometricEnabled(this@MainActivity, enabled)
+            return JSONObject().apply {
+                put("ok", true)
+                put("biometricAvailable", bioAvail)
+                put("biometricEnabled", enabled)
+            }.toString()
+        }
+
+        @JavascriptInterface
+        fun promptBiometricAuth() {
+            launchBiometricPrompt()
+        }
+
+        @JavascriptInterface
+        fun getGoogleStatusJson(): String {
+            return try {
+                val tok = AegisConfig.getGoogleAccessToken(this@MainActivity)
+                val email = AegisConfig.getGoogleEmail(this@MainActivity)
+                JSONObject().apply {
+                    put("connected", tok.isNotBlank())
+                    put("email", email)
+                    put("serverOrigin", AegisConfig.getServerOrigin(this@MainActivity))
+                }.toString()
+            } catch (_: Exception) {
+                "{\"connected\":false}"
+            }
+        }
+
+        @JavascriptInterface
+        fun connectGoogleWorkspace(origin: String?) {
+            runOnUiThread {
+                val target = AegisConfig.normalizeOrigin(
+                    if (!origin.isNullOrBlank()) origin else AegisConfig.getServerOrigin(this@MainActivity)
+                )
+                if (target.isBlank()) {
+                    Toast.makeText(this@MainActivity, "Informe uma URL de servidor Aegis valida.", Toast.LENGTH_SHORT).show()
+                } else {
+                    AegisConfig.setServerOrigin(this@MainActivity, target)
+                    val returnTo = Uri.encode("aegis://oauth/callback")
+                    val oauthUrl = target + "/?aegis_local_google_connect=1&return_to=" + returnTo
+                    openUrlInCustomTab(oauthUrl)
+                }
+            }
+        }
+
+        @JavascriptInterface
+        fun disconnectGoogle(): String {
+            AegisConfig.clearGoogleAuth(this@MainActivity)
+            return JSONObject().apply { put("ok", true) }.toString()
+        }
+
+        @JavascriptInterface
         fun getStatusJson(): String {
             return try {
                 val filesGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -2430,6 +2872,7 @@ class MainActivity : AppCompatActivity() {
                 val level = battIntent?.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1) ?: -1
                 val scale = battIntent?.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, 100) ?: 100
                 val batteryPct = if (level >= 0 && scale > 0) (level * 100) / scale else -1
+                val bioAvail = isBiometricHardwareAvailable()
 
                 JSONObject().apply {
                     put("serviceRunning", AegisForegroundService.isRunning)
@@ -2438,6 +2881,12 @@ class MainActivity : AppCompatActivity() {
                     put("serverOrigin", AegisConfig.getServerOrigin(this@MainActivity))
                     put("pairingCode", AegisConfig.getPairingCode(this@MainActivity))
                     put("paired", AegisConfig.getDeviceToken(this@MainActivity).isNotBlank())
+                    put("googleConnected", AegisConfig.getGoogleAccessToken(this@MainActivity).isNotBlank())
+                    put("googleEmail", AegisConfig.getGoogleEmail(this@MainActivity))
+                    put("biometricAvailable", bioAvail)
+                    put("biometricEnabled", bioAvail && AegisConfig.isBiometricEnabled(this@MainActivity))
+                    put("autoPairLan", AegisConfig.isAutoPairLanEnabled(this@MainActivity))
+                    put("pairedPeersCount", AegisConfig.getPairedPeersCount(this@MainActivity))
                     put("accessibilityEnabled", AegisAccessibilityService.instance != null)
                     put("notificationEnabled", AegisNotificationListener.isActive)
                     put("notificationListenerEnabled", AegisNotificationListener.isActive)
@@ -2512,7 +2961,7 @@ class MainActivity : AppCompatActivity() {
                     Toast.makeText(this@MainActivity, "Informe uma URL de servidor valida.", Toast.LENGTH_SHORT).show()
                 } else {
                     AegisConfig.setServerOrigin(this@MainActivity, target)
-                    webView.loadUrl(target)
+                    openUrlInCustomTab(target)
                 }
             }
         }
@@ -2588,12 +3037,29 @@ class MainActivity : AppCompatActivity() {
         }
 
         @JavascriptInterface
+        fun setAutoPairLan(enabled: Boolean): String {
+            return try {
+                AegisConfig.setAutoPairLanEnabled(this@MainActivity, enabled)
+                if (enabled) {
+                    AegisForegroundService.ensureLanMeshStarted(applicationContext)
+                    AegisForegroundService.triggerLanProbe(this@MainActivity)
+                }
+                AegisForegroundService.getMeshStatusJson(this@MainActivity)
+            } catch (e: Exception) {
+                JSONObject().apply {
+                    put("ok", false)
+                    put("error", e.message ?: "Erro ao configurar conexao automatica")
+                }.toString()
+            }
+        }
+
+        @JavascriptInterface
         fun scanLanMesh(): String {
             return try {
                 AegisForegroundService.ensureLanMeshStarted(applicationContext)
                 AegisForegroundService.triggerLanProbe(this@MainActivity)
                 AegisForegroundService.requestCloudPeers()
-                Thread.sleep(600)
+                Thread.sleep(700)
                 AegisForegroundService.getMeshStatusJson(this@MainActivity)
             } catch (_: Exception) {
                 AegisForegroundService.getMeshStatusJson(this@MainActivity)
@@ -2710,6 +3176,7 @@ import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
 import java.security.MessageDigest
+import java.security.SecureRandom
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
@@ -2750,6 +3217,7 @@ class AegisForegroundService : Service() {
         private val meshScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
         private val lanPeers = ConcurrentHashMap<String, AegisMeshPeer>()
         private val cloudPeers = ConcurrentHashMap<String, AegisMeshPeer>()
+        private val handshakeInFlight = ConcurrentHashMap<String, Boolean>()
         private val pendingCloudCmds = ConcurrentHashMap<String, Pair<CountDownLatch, Array<JSONObject?>>>()
         private val httpClient = OkHttpClient.Builder()
             .connectTimeout(7, TimeUnit.SECONDS)
@@ -2785,6 +3253,27 @@ class AegisForegroundService : Service() {
             return ips
         }
 
+        fun isPrivateLanIp(rawIp: String?): Boolean {
+            val clean = (rawIp ?: "").trim().removePrefix("::ffff:")
+            val parts = clean.split(".")
+            if (parts.size != 4) return false
+            val a = parts[0].toIntOrNull() ?: return false
+            val b = parts[1].toIntOrNull() ?: return false
+            val c = parts[2].toIntOrNull() ?: return false
+            val d = parts[3].toIntOrNull() ?: return false
+            if (a !in 0..255 || b !in 0..255 || c !in 0..255 || d !in 0..255) return false
+            if (a == 10) return true
+            if (a == 192 && b == 168) return true
+            if (a == 172 && b in 16..31) return true
+            return false
+        }
+
+        private fun generateRandomHex(numBytes: Int = 32): String {
+            val bytes = ByteArray(numBytes)
+            SecureRandom().nextBytes(bytes)
+            return bytes.joinToString("") { String.format("%02x", it) }
+        }
+
         private fun computeHmacSha256(secret: String, ts: String, body: String): String {
             val mac = Mac.getInstance("HmacSHA256")
             mac.init(SecretKeySpec(secret.toByteArray(Charsets.UTF_8), "HmacSHA256"))
@@ -2801,6 +3290,51 @@ class AegisForegroundService : Service() {
                 expected.toByteArray(Charsets.UTF_8),
                 sigHeader.trim().lowercase().toByteArray(Charsets.UTF_8)
             )
+        }
+
+        fun ensureLanPeerHandshake(ctx: Context, peerId: String, lanIp: String, meshPort: Int, forceRenew: Boolean = false): String {
+            if (!AegisConfig.isAutoPairLanEnabled(ctx)) return ""
+            if (peerId.isBlank() || !isPrivateLanIp(lanIp)) return ""
+            if (!forceRenew) {
+                val existing = AegisConfig.getPeerKey(ctx, peerId)
+                if (existing.isNotBlank()) return existing
+            }
+            if (handshakeInFlight.putIfAbsent(peerId, true) != null) {
+                return AegisConfig.getPeerKey(ctx, peerId)
+            }
+            return try {
+                val selfId = if (cloudSelfId.isNotBlank()) cloudSelfId else AegisConfig.getDeviceId(ctx)
+                val proposed = generateRandomHex(32)
+                val bodyStr = JSONObject().apply {
+                    put("peerId", selfId)
+                    put("name", Build.MANUFACTURER + " " + Build.MODEL + " (Android)")
+                    put("platform", "android")
+                    put("meshPort", AegisConfig.LAN_MESH_PORT)
+                    put("proposedSecret", proposed)
+                }.toString()
+                val req = Request.Builder()
+                    .url("http://" + lanIp + ":" + meshPort + "/mesh/handshake")
+                    .post(bodyStr.toRequestBody("application/json; charset=utf-8".toMediaType()))
+                    .build()
+                httpClient.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) return ""
+                    val txt = resp.body?.string() ?: "{}"
+                    val parsed = JSONObject(txt)
+                    val shared = parsed.optString("sharedSecret", "")
+                    if (parsed.optBoolean("ok") && shared.length >= 32) {
+                        AegisConfig.setPeerKey(ctx, peerId, shared)
+                        val respId = parsed.optString("peerId", "")
+                        if (respId.isNotBlank()) AegisConfig.setPeerKey(ctx, respId, shared)
+                        shared
+                    } else {
+                        ""
+                    }
+                }
+            } catch (_: Exception) {
+                ""
+            } finally {
+                handshakeInFlight.remove(peerId)
+            }
         }
 
         private fun buildBeaconPacket(ctx: Context, proto: String): String {
@@ -2882,13 +3416,13 @@ class AegisForegroundService : Service() {
                     udpSocket = sock
                     lanDiscoveryActive = true
 
-                    // Periodic broadcast loop
+                    // Periodic broadcast loop (rapido a cada 3s para descoberta instantanea PC <-> Android)
                     meshScope.launch {
                         while (isActive && lanDiscoveryActive) {
                             val now = System.currentTimeMillis()
                             lanPeers.entries.removeIf { now - it.value.lastSeenMs > 35_000L }
                             sendUdpBroadcast(buildBeaconPacket(appCtx, "aegis-mesh-v1"))
-                            delay(6000)
+                            delay(3000)
                         }
                     }
 
@@ -2907,18 +3441,28 @@ class AegisForegroundService : Service() {
                             if (peerId.isBlank() || peerId == selfId || peerId == AegisConfig.getDeviceId(appCtx)) continue
                             val peerIp = packet.address?.hostAddress ?: obj.optString("lanIp")
                             if (peerIp.isBlank() || peerIp == "127.0.0.1") continue
+                            val peerPort = obj.optInt("meshPort", AegisConfig.LAN_MESH_PORT)
                             lanPeers[peerId] = AegisMeshPeer(
                                 id = peerId,
                                 name = obj.optString("name", peerId),
                                 platform = obj.optString("platform", "unknown"),
                                 lanIp = peerIp,
-                                meshPort = obj.optInt("meshPort", AegisConfig.LAN_MESH_PORT),
+                                meshPort = peerPort,
                                 status = "online",
                                 lastSeenMs = System.currentTimeMillis()
                             )
                             if (proto == "aegis-mesh-probe") {
                                 val replyBytes = buildBeaconPacket(appCtx, "aegis-mesh-v1").toByteArray(Charsets.UTF_8)
                                 sock.send(DatagramPacket(replyBytes, replyBytes.size, packet.address, packet.port))
+                            }
+                            if (AegisConfig.isAutoPairLanEnabled(appCtx) &&
+                                isPrivateLanIp(peerIp) &&
+                                AegisConfig.getPeerKey(appCtx, peerId).isBlank() &&
+                                AegisConfig.getMeshKey(appCtx).isBlank()
+                            ) {
+                                meshScope.launch {
+                                    ensureLanPeerHandshake(appCtx, peerId, peerIp, peerPort)
+                                }
                             }
                         } catch (_: Exception) {}
                     }
@@ -3006,6 +3550,7 @@ class AegisForegroundService : Service() {
                 val parts = req.first.split(" ")
                 val method = parts.getOrNull(0) ?: ""
                 val path = parts.getOrNull(1) ?: "/"
+                val remoteIp = sock.inetAddress?.hostAddress ?: ""
                 if (method == "GET" && path == "/mesh/info") {
                     val ips = getLocalIpv4Addresses()
                     val sec = AegisConfig.getEffectiveMeshSecret(ctx)
@@ -3016,23 +3561,95 @@ class AegisForegroundService : Service() {
                         put("lanIps", JSONArray(ips))
                         put("meshPort", AegisConfig.LAN_MESH_PORT)
                         put("authRequired", true)
+                        put("autoPairLan", AegisConfig.isAutoPairLanEnabled(ctx))
                         put("authMode", sec.second)
                     }
                     writeHttpJson(sock, 200, "OK", info.toString())
                     return
                 }
-                if (method == "POST" && path == "/mesh/exec") {
-                    val sec = AegisConfig.getEffectiveMeshSecret(ctx)
-                    if (sec.first.isBlank()) {
-                        writeHttpJson(sock, 401, "Unauthorized", JSONObject().apply {
+                if (method == "POST" && path == "/mesh/handshake") {
+                    if (!AegisConfig.isAutoPairLanEnabled(ctx)) {
+                        writeHttpJson(sock, 403, "Forbidden", JSONObject().apply {
                             put("ok", false)
-                            put("error", "Defina a mesma Chave de Malha LAN no Android e no PC para liberar comandos diretos Wi-Fi.")
+                            put("error", "Auto-pareamento LAN desativado neste Android.")
                         }.toString())
                         return
                     }
+                    if (!isPrivateLanIp(remoteIp)) {
+                        writeHttpJson(sock, 403, "Forbidden", JSONObject().apply {
+                            put("ok", false)
+                            put("error", "Auto-pareamento restrito a rede Wi-Fi privada local.")
+                        }.toString())
+                        return
+                    }
+                    val parsed = JSONObject(req.third.ifBlank { "{}" })
+                    val remotePeerId = parsed.optString("peerId", "").trim().take(128)
+                    val proposed = parsed.optString("proposedSecret", "").trim()
+                    if (remotePeerId.isBlank()) {
+                        writeHttpJson(sock, 400, "Bad Request", JSONObject().apply {
+                            put("ok", false)
+                            put("error", "peerId obrigatorio.")
+                        }.toString())
+                        return
+                    }
+                    val existing = AegisConfig.getPeerKey(ctx, remotePeerId)
+                    val finalSecret = if (existing.isNotBlank()) {
+                        existing
+                    } else if (proposed.length >= 32) {
+                        proposed.take(128)
+                    } else {
+                        generateRandomHex(32)
+                    }
+                    AegisConfig.setPeerKey(ctx, remotePeerId, finalSecret)
+                    val remotePort = parsed.optInt("meshPort", AegisConfig.LAN_MESH_PORT)
+                    lanPeers[remotePeerId] = AegisMeshPeer(
+                        id = remotePeerId,
+                        name = parsed.optString("name", remotePeerId),
+                        platform = parsed.optString("platform", "desktop"),
+                        lanIp = remoteIp.removePrefix("::ffff:"),
+                        meshPort = remotePort,
+                        status = "online",
+                        lastSeenMs = System.currentTimeMillis()
+                    )
+                    val selfId = if (cloudSelfId.isNotBlank()) cloudSelfId else AegisConfig.getDeviceId(ctx)
+                    writeHttpJson(sock, 200, "OK", JSONObject().apply {
+                        put("ok", true)
+                        put("peerId", selfId)
+                        put("name", Build.MANUFACTURER + " " + Build.MODEL + " (Android)")
+                        put("platform", "android")
+                        put("sharedSecret", finalSecret)
+                        put("autoPaired", true)
+                    }.toString())
+                    return
+                }
+                if (method == "POST" && path == "/mesh/exec") {
                     val tsHdr = req.second["x-aegis-mesh-ts"] ?: ""
                     val sigHdr = req.second["x-aegis-mesh-sig"] ?: ""
-                    if (!verifyHmacSha256(sec.first, tsHdr, sigHdr, req.third)) {
+                    val peerHdr = req.second["x-aegis-mesh-peer"] ?: ""
+                    val candidates = mutableListOf<String>()
+                    if (peerHdr.isNotBlank()) {
+                        val pk = AegisConfig.getPeerKey(ctx, peerHdr)
+                        if (pk.isNotBlank()) candidates.add(pk)
+                    }
+                    val globalSec = AegisConfig.getEffectiveMeshSecret(ctx).first
+                    if (globalSec.isNotBlank() && !candidates.contains(globalSec)) {
+                        candidates.add(globalSec)
+                    }
+                    if (candidates.isEmpty()) {
+                        writeHttpJson(sock, 401, "Unauthorized", JSONObject().apply {
+                            put("ok", false)
+                            put("error", "Ative Conexao Automatica no Wi-Fi ou defina uma Chave de Malha LAN.")
+                        }.toString())
+                        return
+                    }
+                    var verified = false
+                    for (cand in candidates) {
+                        if (verifyHmacSha256(cand, tsHdr, sigHdr, req.third)) {
+                            verified = true
+                            break
+                        }
+                    }
+                    if (!verified) {
                         writeHttpJson(sock, 401, "Unauthorized", JSONObject().apply {
                             put("ok", false)
                             put("error", "Assinatura HMAC da Malha LAN invalida ou expirada.")
@@ -3257,6 +3874,7 @@ class AegisForegroundService : Service() {
                     put("status", peer.status)
                     put("lanIp", peer.lanIp)
                     put("meshPort", peer.meshPort)
+                    put("autoPaired", AegisConfig.getPeerKey(ctx, peer.id).isNotBlank())
                     put("transports", JSONArray(transports))
                 })
             }
@@ -3268,6 +3886,10 @@ class AegisForegroundService : Service() {
                 put("lanDiscoveryPort", AegisConfig.LAN_DISCOVERY_PORT)
                 put("lanMeshPort", AegisConfig.LAN_MESH_PORT)
                 put("meshKeyConfigured", AegisConfig.getMeshKey(ctx).isNotBlank())
+                put("autoPairLan", AegisConfig.isAutoPairLanEnabled(ctx))
+                put("pairedPeersCount", AegisConfig.getPairedPeersCount(ctx))
+                put("googleConnected", AegisConfig.getGoogleAccessToken(ctx).isNotBlank())
+                put("googleEmail", AegisConfig.getGoogleEmail(ctx))
                 put("meshSecretSource", sec.second)
                 put("cloudOrigin", AegisConfig.getServerOrigin(ctx))
                 put("transports", JSONObject().apply {
@@ -3281,30 +3903,49 @@ class AegisForegroundService : Service() {
             }.toString()
         }
 
-        private fun sendLanP2pSync(ctx: Context, lanIp: String, meshPort: Int, commandType: String, payload: JSONObject): JSONObject {
-            val sec = AegisConfig.getEffectiveMeshSecret(ctx)
-            if (sec.first.isBlank()) {
+        private fun sendLanP2pSync(
+            ctx: Context,
+            peerId: String,
+            lanIp: String,
+            meshPort: Int,
+            commandType: String,
+            payload: JSONObject,
+            allowRetry: Boolean = true
+        ): JSONObject {
+            var secret = AegisConfig.getEffectiveMeshSecret(ctx, peerId).first
+            if (secret.isBlank() && AegisConfig.isAutoPairLanEnabled(ctx) && isPrivateLanIp(lanIp)) {
+                secret = ensureLanPeerHandshake(ctx, peerId, lanIp, meshPort)
+            }
+            if (secret.isBlank()) {
                 return JSONObject().apply {
                     put("ok", false)
-                    put("error", "Defina a mesma Chave de Malha LAN aqui e no PC para executar comandos diretos via Wi-Fi.")
+                    put("error", "Ative Conexao Automatica no Wi-Fi ou defina a mesma Chave de Malha LAN no Android e no PC.")
                 }
             }
+            val selfId = if (cloudSelfId.isNotBlank()) cloudSelfId else AegisConfig.getDeviceId(ctx)
             val bodyStr = JSONObject().apply {
-                put("fromId", if (cloudSelfId.isNotBlank()) cloudSelfId else AegisConfig.getDeviceId(ctx))
+                put("fromId", selfId)
                 put("fromName", Build.MANUFACTURER + " " + Build.MODEL)
                 put("commandType", commandType)
                 put("payload", payload)
             }.toString()
             val ts = System.currentTimeMillis().toString()
-            val sig = computeHmacSha256(sec.first, ts, bodyStr)
+            val sig = computeHmacSha256(secret, ts, bodyStr)
             return try {
                 val req = Request.Builder()
                     .url("http://" + lanIp + ":" + meshPort + "/mesh/exec")
                     .post(bodyStr.toRequestBody("application/json; charset=utf-8".toMediaType()))
+                    .header("X-Aegis-Mesh-Peer", selfId)
                     .header("X-Aegis-Mesh-Ts", ts)
                     .header("X-Aegis-Mesh-Sig", sig)
                     .build()
                 httpClient.newCall(req).execute().use { resp ->
+                    if (resp.code == 401 && allowRetry && AegisConfig.isAutoPairLanEnabled(ctx) && isPrivateLanIp(lanIp)) {
+                        val renewed = ensureLanPeerHandshake(ctx, peerId, lanIp, meshPort, forceRenew = true)
+                        if (renewed.isNotBlank()) {
+                            return sendLanP2pSync(ctx, peerId, lanIp, meshPort, commandType, payload, allowRetry = false)
+                        }
+                    }
                     val txt = resp.body?.string() ?: "{}"
                     val parsed = try { JSONObject(txt) } catch (_: Exception) { JSONObject().apply { put("ok", false); put("error", txt) } }
                     parsed.put("transportUsed", "lan_p2p")
@@ -3349,13 +3990,13 @@ class AegisForegroundService : Service() {
             val pair = getMergedPeers().find { it.first.id == peerId }
                 ?: return JSONObject().apply {
                     put("ok", false)
-                    put("error", "Dispositivo nao encontrado na malha. Toque em Escanear Malha.")
+                    put("error", "Dispositivo nao encontrado na malha. Toque em Buscar PCs.")
                 }
             val peer = pair.first
             val transports = pair.second
             val errors = mutableListOf<String>()
             if (peer.lanIp.isNotBlank()) {
-                val lanRes = sendLanP2pSync(ctx, peer.lanIp, peer.meshPort, commandType, payload)
+                val lanRes = sendLanP2pSync(ctx, peer.id, peer.lanIp, peer.meshPort, commandType, payload)
                 if (lanRes.optBoolean("ok")) return lanRes
                 errors.add("LAN: " + lanRes.optString("error", "falhou"))
             }
@@ -3381,7 +4022,7 @@ class AegisForegroundService : Service() {
             val payload = JSONObject().apply { put("text", text) }
             for ((peer, _) in getMergedPeers()) {
                 if (peer.lanIp.isNotBlank()) {
-                    val r = sendLanP2pSync(ctx, peer.lanIp, peer.meshPort, "clipboard_sync", payload)
+                    val r = sendLanP2pSync(ctx, peer.id, peer.lanIp, peer.meshPort, "clipboard_sync", payload)
                     if (r.optBoolean("ok")) delivered++
                 }
             }
@@ -3486,29 +4127,38 @@ class AegisForegroundService : Service() {
                 updateNotification("Conectado: LAN Wi-Fi + " + AegisConfig.getServerOrigin(this@AegisForegroundService))
                 try {
                     val ips = getLocalIpv4Addresses()
+                    val token = AegisConfig.getDeviceToken(this@AegisForegroundService)
+                    val googleTok = AegisConfig.getGoogleAccessToken(this@AegisForegroundService)
+                    val caps = JSONArray(listOf(
+                        "ping",
+                        "android_native_app",
+                        "lan_p2p",
+                        "clipboard_sync",
+                        "accessibility_gestures",
+                        "notification_listener",
+                        "file_system",
+                        "apps_launcher",
+                        "telemetry"
+                    ))
                     val hello = JSONObject().apply {
-                        put("type", "hello")
                         put("name", Build.MANUFACTURER + " " + Build.MODEL)
                         put("platform", "android")
                         put("transport", "android_app_ws")
                         put("serialOrUid", AegisConfig.getDeviceId(this@AegisForegroundService))
-                        val token = AegisConfig.getDeviceToken(this@AegisForegroundService)
-                        if (token.isNotBlank()) put("token", token)
-                        else put("pairingCode", AegisConfig.getPairingCode(this@AegisForegroundService))
                         put("telemetry", collectTelemetry())
                         put("lanIp", ips.firstOrNull() ?: "")
                         put("meshPort", AegisConfig.LAN_MESH_PORT)
-                        put("capabilities", JSONArray(listOf(
-                            "ping",
-                            "android_native_app",
-                            "lan_p2p",
-                            "clipboard_sync",
-                            "accessibility_gestures",
-                            "notification_listener",
-                            "file_system",
-                            "apps_launcher",
-                            "telemetry"
-                        )))
+                        put("capabilities", caps)
+                        if (token.isNotBlank()) {
+                            put("type", "hello")
+                            put("token", token)
+                        } else if (googleTok.isNotBlank()) {
+                            put("type", "account_pair")
+                            put("googleAccessToken", googleTok)
+                        } else {
+                            put("type", "hello")
+                            put("pairingCode", AegisConfig.getPairingCode(this@AegisForegroundService))
+                        }
                     }
                     ws.send(hello.toString())
                 } catch (_: Exception) {}

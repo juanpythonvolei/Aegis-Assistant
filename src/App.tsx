@@ -814,9 +814,12 @@ export default function App() {
   const localBridgeParams = typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : null;
   const isLocalGoogleConnectBridge = localBridgeParams?.get('aegis_local_google_connect') === '1';
   const rawReturnTo = localBridgeParams?.get('return_to') || 'http://127.0.0.1:3847/google/oauth/receive';
-  const safeLocalReturnTo = /^http:\/\/(127\.0\.0\.1|localhost)(:\d{2,5})?\/google\/oauth\/receive$/i.test(rawReturnTo)
-    ? rawReturnTo
-    : 'http://127.0.0.1:3847/google/oauth/receive';
+  const isAndroidDeepLinkReturn = /^aegis:\/\/oauth\/callback$/i.test(rawReturnTo);
+  const safeLocalReturnTo =
+    isAndroidDeepLinkReturn ||
+    /^http:\/\/(127\.0\.0\.1|localhost)(:\d{2,5})?\/google\/oauth\/receive$/i.test(rawReturnTo)
+      ? rawReturnTo
+      : 'http://127.0.0.1:3847/google/oauth/receive';
 
   if (isLocalGoogleConnectBridge) {
     const forwardTokenToLocal = (token: string, email?: string | null) => {
@@ -845,10 +848,14 @@ export default function App() {
           </div>
           <div className="space-y-1.5">
             <h1 className="font-display text-lg font-bold text-slate-100">
-              Conectar Google ao Aegis Local
+              {isAndroidDeepLinkReturn ? 'Conectar Google ao Aegis Android' : 'Conectar Google ao Aegis Local'}
             </h1>
             <p className="text-xs leading-relaxed text-slate-400">
-              Autorize sua conta Google (Drive, Gmail, Agenda, Docs, Planilhas e Tarefas) para enviar a credencial com segurança direto para o seu aplicativo local em <code className="text-amber-300">127.0.0.1:3847</code>.
+              Autorize sua conta Google (Drive, Gmail, Agenda, Docs, Planilhas e Tarefas) para retornar a credencial com segurança direto para o seu aplicativo{' '}
+              <code className="text-amber-300">
+                {isAndroidDeepLinkReturn ? 'Aegis Android' : '127.0.0.1:3847'}
+              </code>
+              .
             </p>
           </div>
           {authError && (

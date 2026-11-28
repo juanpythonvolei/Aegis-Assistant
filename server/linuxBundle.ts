@@ -2482,6 +2482,9 @@ const server = http.createServer(async (req, res) => {
       if (typeof body.lanDiscovery === 'boolean') {
         cfg.lanDiscovery = body.lanDiscovery;
       }
+      if (typeof body.autoPairLan === 'boolean') {
+        cfg.autoPairLan = body.autoPairLan;
+      }
       saveMeshConfig(cfg);
       if (typeof body.cloudUrl === 'string' && body.cloudUrl.trim()) {
         saveLocalSettings({ cloudOrigin: body.cloudUrl.trim().replace(/\\/+$/, '') });
@@ -2549,13 +2552,19 @@ function loadMeshConfig() {
   try {
     if (fs.existsSync(MESH_CONFIG_FILE)) {
       const parsed = JSON.parse(fs.readFileSync(MESH_CONFIG_FILE, 'utf-8'));
-      if (parsed && parsed.deviceId) return parsed;
+      if (parsed && parsed.deviceId) {
+        if (typeof parsed.autoPairLan !== 'boolean') parsed.autoPairLan = true;
+        if (!parsed.peerKeys || typeof parsed.peerKeys !== 'object') parsed.peerKeys = {};
+        return parsed;
+      }
     }
   } catch {}
   const fresh = {
     deviceId: 'aegis_' + (IS_WIN ? 'win' : 'linux') + '_' + crypto.randomBytes(6).toString('hex'),
     meshKey: process.env.AEGIS_MESH_KEY || '',
     lanDiscovery: true,
+    autoPairLan: true,
+    peerKeys: {},
   };
   try {
     fs.writeFileSync(MESH_CONFIG_FILE, JSON.stringify(fresh, null, 2), { mode: 0o600 });
@@ -2568,6 +2577,18 @@ function saveMeshConfig(cfg) {
 }
 
 const MESH_CFG_INIT = loadMeshConfig();
+
+function isPrivateLanIp(rawIp) {
+  const ip = String(rawIp || '').replace(/^::ffff:/, '').trim();
+  if (/^10\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$/.test(ip)) return true;
+  if (/^192\\.168\\.\\d{1,3}\\.\\d{1,3}$/.test(ip)) return true;
+  const m172 = ip.match(/^172\\.(\\d{1,3})\\.\\d{1,3}\\.\\d{1,3}$/);
+  if (m172) {
+    const oct = Number(m172[1]);
+    if (oct >= 16 && oct <= 31) return true;
+  }
+  return false;
+}
 
 function getLanIpv4Addresses() {
   const ips = [];
@@ -2584,8 +2605,11 @@ function getLanIpv4Addresses() {
   return ips;
 }
 
-function getEffectiveMeshSecret() {
+function getEffectiveMeshSecret(peerId = '') {
   const cfg = loadMeshConfig();
+  if (peerId && cfg.peerKeys && typeof cfg.peerKeys[peerId] === 'string' && cfg.peerKeys[peerId].length >= 32) {
+    return { secret: cfg.peerKeys[peerId], source: 'auto_lan_pair' };
+  }
   if (cfg.meshKey && cfg.meshKey.trim()) {
     return { secret: cfg.meshKey.trim(), source: 'custom_key' };
   }
@@ -2595,7 +2619,7 @@ function getEffectiveMeshSecret() {
     const derived = crypto.createHash('sha256').update('aegis-google-mesh:' + email).digest('hex');
     return { secret: derived, source: 'google_account' };
   }
-  return { secret: '', source: 'none' };
+  return { secret: '', source: cfg.autoPairLan !== false ? 'auto_ready' : 'none' };
 }
 
 function computeMeshHmac(secret, ts, bodyStr) {
@@ -2693,6 +2717,13 @@ function startLanDiscovery() {
           const replyBuf = Buffer.from(buildLanBeaconPacket('aegis-mesh-v1'), 'utf-8');
           sock.send(replyBuf, 0, replyBuf.length, rinfo.port || LAN_DISCOVERY_PORT, peerIp);
         }
+        // Auto-negotiate per-peer HMAC key in background on private LAN
+        if (myCfg.autoPairLan !== false && isPrivateLanIp(peerIp)) {
+          const existingSec = getEffectiveMeshSecret(data.deviceId);
+          if (!existingSec.secret) {
+            void ensureLanPeerHandshake(data.deviceId, peerIp, Number(data.meshPort || LAN_MESH_PORT));
+          }
+        }
       } catch {}
     });
     sock.bind(LAN_DISCOVERY_PORT, () => {
@@ -2706,7 +2737,7 @@ function startLanDiscovery() {
           if (now - v.lastSeen > 35_000) lanPeers.delete(k);
         }
         sendLanBroadcast(buildLanBeaconPacket('aegis-mesh-v1'));
-      }, 6000);
+      }, 3500);
     });
   } catch (e) {
     console.warn('[Aegis LAN Mesh] Falha ao iniciar UDP discovery:', e.message);
@@ -2769,10 +2800,52 @@ async function handleLocalMeshCommand(commandType, payload = {}, fromName = 'pee
   return { ok: false, error: 'Comando de malha não suportado no Desktop: ' + commandType };
 }
 
+const handshakeInFlight = new Set();
+async function ensureLanPeerHandshake(peerId, lanIp, meshPort = LAN_MESH_PORT) {
+  if (!peerId || !lanIp || !isPrivateLanIp(lanIp)) return '';
+  const cfg = loadMeshConfig();
+  if (cfg.peerKeys && cfg.peerKeys[peerId]) return cfg.peerKeys[peerId];
+  if (cfg.autoPairLan === false) return '';
+  if (handshakeInFlight.has(peerId)) return '';
+  handshakeInFlight.add(peerId);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  try {
+    const offeredKey = crypto.randomBytes(32).toString('hex');
+    const resp = await fetch('http://' + lanIp + ':' + (meshPort || LAN_MESH_PORT) + '/mesh/handshake', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        peerId: cloudSelfId || cfg.deviceId,
+        name: os.hostname() + (IS_WIN ? ' (Windows)' : ' (Linux)'),
+        platform: IS_WIN ? 'windows' : 'linux',
+        meshPort: LAN_MESH_PORT,
+        offeredKey,
+      }),
+      signal: controller.signal,
+    });
+    const data = await resp.json().catch(() => null);
+    if (resp.ok && data && data.ok && typeof data.sharedKey === 'string' && data.sharedKey.length >= 32) {
+      const latest = loadMeshConfig();
+      latest.peerKeys = latest.peerKeys || {};
+      latest.peerKeys[peerId] = data.sharedKey;
+      if (data.deviceId && data.deviceId !== peerId) latest.peerKeys[data.deviceId] = data.sharedKey;
+      saveMeshConfig(latest);
+      return data.sharedKey;
+    }
+  } catch {}
+  finally {
+    clearTimeout(timer);
+    handshakeInFlight.delete(peerId);
+  }
+  return '';
+}
+
 function startLanMeshServer() {
   try {
     const mServer = http.createServer(async (req, res) => {
       const u = new URL(req.url || '/', 'http://127.0.0.1:' + LAN_MESH_PORT);
+      const remoteIp = String(req.socket?.remoteAddress || '').replace(/^::ffff:/, '');
       if (u.pathname === '/mesh/info' && req.method === 'GET') {
         const cfg = loadMeshConfig();
         const sec = getEffectiveMeshSecret();
@@ -2784,8 +2857,63 @@ function startLanMeshServer() {
           lanIps: getLanIpv4Addresses(),
           meshPort: LAN_MESH_PORT,
           authRequired: true,
+          autoPairLan: cfg.autoPairLan !== false,
           authMode: sec.source,
         }));
+      }
+      if (u.pathname === '/mesh/handshake' && req.method === 'POST') {
+        const cfg = loadMeshConfig();
+        if (cfg.autoPairLan === false) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ ok: false, error: 'Auto-pareamento LAN desativado neste PC.' }));
+        }
+        if (!isPrivateLanIp(remoteIp)) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ ok: false, error: 'Auto-pareamento permitido apenas na rede local privada.' }));
+        }
+        let rawBody = '';
+        for await (const chunk of req) {
+          rawBody += chunk;
+          if (rawBody.length > 16 * 1024) {
+            res.writeHead(413, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ ok: false, error: 'Payload excede limite.' }));
+          }
+        }
+        try {
+          const body = JSON.parse(rawBody || '{}');
+          const peerId = String(body.peerId || '').trim().slice(0, 80);
+          if (!peerId) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ ok: false, error: 'peerId obrigatório.' }));
+          }
+          const offered = String(body.offeredKey || '').trim();
+          const existing = cfg.peerKeys && cfg.peerKeys[peerId];
+          const sharedKey = existing || (/^[a-f0-9]{64}$/i.test(offered) ? offered : crypto.randomBytes(32).toString('hex'));
+          cfg.peerKeys = cfg.peerKeys || {};
+          cfg.peerKeys[peerId] = sharedKey;
+          saveMeshConfig(cfg);
+          lanPeers.set(peerId, {
+            id: peerId,
+            name: String(body.name || peerId).slice(0, 80),
+            platform: String(body.platform || 'android'),
+            lanIp: remoteIp,
+            meshPort: Number(body.meshPort || LAN_MESH_PORT),
+            authMode: 'auto_lan_pair',
+            capabilities: ['ping', 'telemetry', 'list_files', 'read_file', 'clipboard_sync'],
+            lastSeen: Date.now(),
+          });
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({
+            ok: true,
+            deviceId: cloudSelfId || cfg.deviceId,
+            name: os.hostname() + (IS_WIN ? ' (Windows)' : ' (Linux)'),
+            platform: IS_WIN ? 'windows' : 'linux',
+            sharedKey,
+          }));
+        } catch (err) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ ok: false, error: err.message }));
+        }
       }
       if (u.pathname === '/mesh/exec' && req.method === 'POST') {
         let rawBody = '';
@@ -2796,17 +2924,23 @@ function startLanMeshServer() {
             return res.end(JSON.stringify({ ok: false, error: 'Payload excede limite.' }));
           }
         }
-        const sec = getEffectiveMeshSecret();
-        if (!sec.secret) {
+        const peerHdr = String(req.headers['x-aegis-mesh-peer'] || '').trim();
+        const tsHdr = String(req.headers['x-aegis-mesh-ts'] || '');
+        const sigHdr = String(req.headers['x-aegis-mesh-sig'] || '');
+        const cfg = loadMeshConfig();
+        const candidateSecrets = [];
+        if (peerHdr && cfg.peerKeys && cfg.peerKeys[peerHdr]) candidateSecrets.push(cfg.peerKeys[peerHdr]);
+        const globalSec = getEffectiveMeshSecret();
+        if (globalSec.secret) candidateSecrets.push(globalSec.secret);
+        if (!candidateSecrets.length) {
           res.writeHead(401, { 'Content-Type': 'application/json' });
           return res.end(JSON.stringify({
             ok: false,
-            error: 'Defina uma Chave de Malha LAN compartilhada ou conecte a mesma conta Google em ambos os dispositivos.',
+            error: 'Dispositivo ainda não pareado na LAN. Clique em Escanear Malha ou defina uma Chave LAN.',
           }));
         }
-        const tsHdr = String(req.headers['x-aegis-mesh-ts'] || '');
-        const sigHdr = String(req.headers['x-aegis-mesh-sig'] || '');
-        if (!verifyMeshHmac(sec.secret, tsHdr, sigHdr, rawBody)) {
+        const verified = candidateSecrets.some((s) => verifyMeshHmac(s, tsHdr, sigHdr, rawBody));
+        if (!verified) {
           res.writeHead(401, { 'Content-Type': 'application/json' });
           return res.end(JSON.stringify({ ok: false, error: 'Assinatura HMAC da Malha LAN inválida ou expirada.' }));
         }
@@ -2830,23 +2964,28 @@ function startLanMeshServer() {
     });
     mServer.listen(LAN_MESH_PORT, '0.0.0.0', () => {
       lanMeshServerActive = true;
-      console.log('[Aegis LAN P2P] Canal direto autenticado (HMAC-SHA256) ativo em 0.0.0.0:' + LAN_MESH_PORT);
+      console.log('[Aegis LAN P2P] Canal direto autenticado (HMAC-SHA256 + Auto-Pair LAN) ativo em 0.0.0.0:' + LAN_MESH_PORT);
     });
   } catch (e) {
     console.warn('[Aegis LAN P2P] Erro ao iniciar servidor P2P:', e.message);
   }
 }
 
-async function sendLanP2pCommand(lanIp, meshPort, commandType, payload = {}) {
-  const sec = getEffectiveMeshSecret();
+async function sendLanP2pCommand(lanIp, meshPort, commandType, payload = {}, targetPeerId = '') {
+  let sec = getEffectiveMeshSecret(targetPeerId);
+  if (!sec.secret && targetPeerId && isPrivateLanIp(lanIp)) {
+    const autoKey = await ensureLanPeerHandshake(targetPeerId, lanIp, meshPort || LAN_MESH_PORT);
+    if (autoKey) sec = { secret: autoKey, source: 'auto_lan_pair' };
+  }
   if (!sec.secret) {
     return {
       ok: false,
-      error: 'Configure uma Chave de Malha LAN compartilhada (ou conecte o Google) para executar via Wi-Fi/LAN direto.',
+      error: 'Ative o Auto-Pareamento LAN ou defina uma Chave de Malha compartilhada para executar via Wi-Fi.',
     };
   }
+  const myId = cloudSelfId || loadMeshConfig().deviceId;
   const bodyStr = JSON.stringify({
-    fromId: cloudSelfId || loadMeshConfig().deviceId,
+    fromId: myId,
     fromName: os.hostname(),
     commandType,
     payload,
@@ -2860,6 +2999,7 @@ async function sendLanP2pCommand(lanIp, meshPort, commandType, payload = {}) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        'X-Aegis-Mesh-Peer': myId,
         'X-Aegis-Mesh-Ts': ts,
         'X-Aegis-Mesh-Sig': sig,
       },
@@ -2994,7 +3134,7 @@ async function execMeshPeerCommand(peerId, commandType, payload = {}, preferredT
   const errors = [];
   for (const tr of order) {
     if (tr === 'lan_p2p' && peer.lanIp) {
-      const r = await sendLanP2pCommand(peer.lanIp, peer.meshPort || LAN_MESH_PORT, commandType, payload);
+      const r = await sendLanP2pCommand(peer.lanIp, peer.meshPort || LAN_MESH_PORT, commandType, payload, peer.id);
       if (r.ok) return { ...r, peerId: peer.id, peerName: peer.name, transportUsed: 'lan_p2p' };
       errors.push('LAN P2P: ' + (r.error || 'falhou'));
     } else if (tr === 'cloud_ws' && !peer.id.startsWith('adb:')) {
@@ -3017,7 +3157,7 @@ async function broadcastMeshClipboard(text) {
   const peers = getUnifiedMeshPeers();
   for (const p of peers) {
     if (p.lanIp) {
-      const r = await sendLanP2pCommand(p.lanIp, p.meshPort || LAN_MESH_PORT, 'clipboard_sync', { text });
+      const r = await sendLanP2pCommand(p.lanIp, p.meshPort || LAN_MESH_PORT, 'clipboard_sync', { text }, p.id);
       if (r.ok) delivered++;
     }
   }
@@ -3042,6 +3182,8 @@ function getMeshStatusSnapshot() {
     lanIps: getLanIpv4Addresses(),
     lanDiscoveryPort: LAN_DISCOVERY_PORT,
     lanMeshPort: LAN_MESH_PORT,
+    autoPairLan: cfg.autoPairLan !== false,
+    pairedPeersCount: cfg.peerKeys ? Object.keys(cfg.peerKeys).length : 0,
     meshKeyConfigured: Boolean(cfg.meshKey && cfg.meshKey.trim()),
     meshSecretSource: sec.source,
     googleEmail: cloud?.google?.email || null,
